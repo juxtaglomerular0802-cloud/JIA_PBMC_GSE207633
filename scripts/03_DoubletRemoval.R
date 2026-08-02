@@ -19,14 +19,12 @@ combined_qc <- readRDS("combined_QC.rds")
 
 
 # Transform Seurat obj as SingleCellExperiment
-DefaultAssay(combined_qc) <- "RNA"
+combined_qc <- JoinLayers(combined_qc)
 
 sce <- as.SingleCellExperiment(
-  combined_qc,
-  assay = "RNA"
+    combined_qc,
+    assay = "RNA"
 )
-
-sce
 
 # Check whether there is "counts" matrix
 assayNames(sce)
