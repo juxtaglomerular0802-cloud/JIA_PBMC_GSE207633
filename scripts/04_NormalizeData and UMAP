@@ -1,0 +1,195 @@
+setwd("D:/scRNA/GSE207633_JIA/GSE207633_RAW")
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+combined_singlet <- readRDS(
+  "GSE207633_QC_doublet_removed_before_normalization.rds"
+)
+
+DefaultAssay(combined_singlet) <- "RNA"
+
+combined_singlet
+table(combined_singlet$GSM)
+
+
+# Separate as individual Seurat obj
+sample.list <- SplitObject(
+  combined_singlet,
+  split.by = "GSM"
+)
+
+length(sample.list)
+names(sample.list)
+
+# Normalize each samples independently 
+sample.list <- lapply(
+  sample.list,
+  function(obj) {
+
+    DefaultAssay(obj) <- "RNA"
+
+    obj <- NormalizeData(
+      obj,
+      normalization.method = "LogNormalize",
+      scale.factor = 10000,
+      verbose = FALSE
+    )
+
+    obj <- FindVariableFeatures(
+      obj,
+      selection.method = "vst",
+      nfeatures = 2000,
+      verbose = FALSE
+    )
+
+    return(obj)
+  }
+)
+
+sample.list[[1]]
+head(VariableFeatures(sample.list[[1]]))
+length(VariableFeatures(sample.list[[1]]))
+
+
+# Select integration feature
+integration.features <- SelectIntegrationFeatures(
+  object.list = sample.list,
+  nfeatures = 2000
+)
+
+length(integration.features)
+head(integration.features)
+
+# Find CCA integration anchor
+set.seed(1234)
+
+anchors <- FindIntegrationAnchors(
+  object.list = sample.list,
+  anchor.features = integration.features,
+  normalization.method = "LogNormalize",
+  reduction = "cca",
+  dims = 1:50,
+  k.anchor = 5,
+  verbose = TRUE
+)
+
+# Data integration
+combined_integrated <- IntegrateData(
+  anchorset = anchors,
+  normalization.method = "LogNormalize",
+  dims = 1:50,
+  new.assay.name = "integrated",
+  verbose = TRUE
+)
+
+combined_integrated
+Assays(combined_integrated)
+
+# Convert as integrated assay
+DefaultAssay(combined_integrated) <- "integrated"
+combined_integrated <- ScaleData(
+  combined_integrated,
+  features = rownames(combined_integrated),
+  verbose = TRUE
+)
+
+# PCA analysis
+set.seed(1234)
+
+combined_integrated <- RunPCA(
+  combined_integrated,
+  assay = "integrated",
+  features = VariableFeatures(combined_integrated),
+  npcs = 50,
+  verbose = TRUE
+)
+
+# Check Elbow plot
+ElbowPlot(
+  combined_integrated,
+  ndims = 50
+)
+
+pdf(
+  "GSE207633_PCA_elbowplot_50PCs.pdf",
+  width = 7,
+  height = 5
+)
+
+print(
+  ElbowPlot(
+    combined_integrated,
+    ndims = 50
+  )
+)
+
+dev.off()
+
+# UMAP clustering
+set.seed(1234)
+
+combined_integrated <- RunUMAP(
+  combined_integrated,
+  reduction = "pca",
+  dims = 1:36,
+  reduction.name = "umap",
+  reduction.key = "UMAP_",
+  verbose = TRUE
+)
+
+# Neighbor graph
+combined_integrated <- FindNeighbors(
+  combined_integrated,
+  reduction = "pca",
+  dims = 1:36,
+  verbose = TRUE
+)
+
+# Clustering as resolution 0.6
+set.seed(1234)
+
+combined_integrated <- FindClusters(
+  combined_integrated,
+  resolution = 0.6,
+  algorithm = 1,
+  random.seed = 1234,
+  verbose = TRUE
+)
+
+# Check UMAP
+DimPlot(
+  combined_integrated,
+  reduction = "umap",
+  label = TRUE,
+  repel = TRUE
+) +
+  NoLegend()
+
+DimPlot(
+  combined_integrated,
+  reduction = "umap",
+  group.by = "Group"
+)
+
+DimPlot(
+  combined_integrated,
+  reduction = "umap",
+  group.by = "GSM"
+)
+
+DimPlot(
+  combined_integrated,
+  reduction = "umap",
+  split.by = "Group",
+  ncol = 3
+)
+
+# Save RDS
+saveRDS(
+  combined_integrated,
+  file = "GSE207633_CCA_PCA36_UMAP_res0.6.rds"
+)
+
