@@ -170,10 +170,20 @@ ncol(combined_qc)
 ncol(combined_singlet)
 
 before_doublet <- combined_qc@meta.data %>%
-  count(GSM, Group, Patient, name = "before_doublet_removal")
+  dplyr::count(
+    GSM,
+    Group,
+    Patient,
+    name = "before_doublet_removal"
+  )
 
 after_doublet <- combined_singlet@meta.data %>%
-  count(GSM, Group, Patient, name = "after_doublet_removal")
+  dplyr::count(
+    GSM,
+    Group,
+    Patient,
+    name = "after_doublet_removal"
+  )
 
 doublet_cell_counts <- left_join(
   before_doublet,
