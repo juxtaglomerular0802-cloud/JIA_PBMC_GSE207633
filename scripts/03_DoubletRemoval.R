@@ -69,7 +69,7 @@ head(
 
 # Calculate Doublet proportion by individual samples
 doublet_summary <- combined_qc@meta.data %>%
-  count(
+  dplyr::count(
     GSM,
     Group,
     scDblFinder.class,
