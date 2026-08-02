@@ -1,0 +1,47 @@
+# Merge RNA layer
+DefaultAssay(combined_integrated) <- "RNA"
+Layers(combined_integrated[["RNA"]])
+
+combined_integrated <- JoinLayers(
+  combined_integrated,
+  assay = "RNA"
+)
+
+# Find Markers for Each Cluster
+Idents(combined_integrated) <- "seurat_clusters"
+
+DefaultAssay(combined_integrated) <- "RNA"
+
+markers_all <- FindAllMarkers(
+  combined_integrated,
+  assay = "RNA",
+  slot = "data",
+  only.pos = TRUE,
+  test.use = "wilcox",
+  min.pct = 0.25,
+  logfc.threshold = 0.25,
+  verbose = TRUE
+)
+
+write.csv(
+  markers_all,
+  file = "GSE207633_cluster_markers_res0.6.csv",
+  row.names = FALSE
+)
+
+
+# Top10 markers for each cluster
+top10_markers <- markers_all %>%
+  group_by(cluster) %>%
+  slice_max(
+    order_by = avg_log2FC,
+    n = 10,
+    with_ties = FALSE
+  ) %>%
+  ungroup()
+
+write.csv(
+  top10_markers,
+  file = "GSE207633_top10_markers_per_cluster.csv",
+  row.names = FALSE
+)
