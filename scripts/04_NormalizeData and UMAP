@@ -80,7 +80,7 @@ anchors <- FindIntegrationAnchors(
 combined_integrated <- IntegrateData(
   anchorset = anchors,
   normalization.method = "LogNormalize",
-  dims = 1:50,
+  dims = 1:30,
   new.assay.name = "integrated",
   verbose = TRUE
 )
