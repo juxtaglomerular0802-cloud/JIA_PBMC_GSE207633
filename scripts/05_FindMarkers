@@ -1,19 +1,185 @@
-# Merge RNA layer
+library(Seurat)
+library(Azimuth)
+library(SeuratData)
+library(dplyr)
+library(ggplot2)
+
+# Check RNA layer and merge
 DefaultAssay(combined_integrated) <- "RNA"
 Layers(combined_integrated[["RNA"]])
 
 combined_integrated <- JoinLayers(
-  combined_integrated,
+  object = combined_integrated,
   assay = "RNA"
 )
 
-# Find Markers for Each Cluster
-Idents(combined_integrated) <- "seurat_clusters"
+Layers(combined_integrated[["RNA"]])
 
+dim(LayerData(
+  combined_integrated,
+  assay = "RNA",
+  layer = "counts"
+))
+
+
+# Azimuth PBMC annotation
 DefaultAssay(combined_integrated) <- "RNA"
 
-markers_all <- FindAllMarkers(
+combined_integrated <- RunAzimuth(
+  query = combined_integrated,
+  reference = "pbmcref"
+)
+
+# Cjheck Result Column
+grep(
+  pattern = "predicted|score|mapping",
+  x = colnames(combined_integrated@meta.data),
+  value = TRUE
+)
+
+# Check Azimuth label in UMAP
+Reductions(combined_integrated)
+
+DimPlot(
   combined_integrated,
+  reduction = "umap",
+  group.by = "predicted.celltype.l2",
+  label = TRUE,
+  repel = TRUE,
+  label.size = 3
+) + NoLegend()
+
+DimPlot(
+  combined_integrated,
+  reduction = "ref.umap",
+  group.by = "predicted.celltype.l2",
+  label = TRUE,
+  repel = TRUE,
+  label.size = 3
+) + NoLegend()
+
+# Check Azimuth label distribution by clusters
+table(
+  combined_integrated$seurat_clusters,
+  combined_integrated$predicted.celltype.l2
+)
+
+cluster_azimuth_prop <- prop.table(
+  table(
+    cluster = combined_integrated$seurat_clusters,
+    azimuth = combined_integrated$predicted.celltype.l2
+  ),
+  margin = 1
+)
+
+round(cluster_azimuth_prop, 3)
+
+write.csv(
+  as.data.frame.matrix(cluster_azimuth_prop),
+  file = "GSE207633_cluster_Azimuth_L2_proportions.csv"
+)
+
+# Select representative Azimuth label for each cluster
+cluster_annotation <- combined_integrated@meta.data %>%
+  mutate(
+    cluster = as.character(seurat_clusters),
+    azimuth_label = predicted.celltype.l2
+  ) %>%
+  count(cluster, azimuth_label, name = "n") %>%
+  group_by(cluster) %>%
+  mutate(
+    total_cells = sum(n),
+    proportion = n / total_cells
+  ) %>%
+  slice_max(
+    order_by = n,
+    n = 1,
+    with_ties = FALSE
+  ) %>%
+  ungroup() %>%
+  arrange(as.numeric(cluster))
+
+cluster_annotation
+
+write.csv(
+  cluster_annotation,
+  file = "GSE207633_cluster_Azimuth_annotation.csv",
+  row.names = FALSE
+)
+
+
+# Add Representative label to obj
+cluster_to_celltype <- setNames(
+  cluster_annotation$azimuth_label,
+  cluster_annotation$cluster
+)
+
+combined_integrated$cluster_celltype <- unname(
+  cluster_to_celltype[
+    as.character(combined_integrated$seurat_clusters)
+  ]
+)
+
+table(
+  combined_integrated$seurat_clusters,
+  combined_integrated$cluster_celltype
+)
+
+DimPlot(
+  combined_integrated,
+  reduction = "umap",
+  group.by = "cluster_celltype",
+  label = TRUE,
+  repel = TRUE,
+  label.size = 3
+) + NoLegend()
+
+
+# Check prediction score
+summary(
+  combined_integrated$predicted.celltype.l2.score
+)
+
+cluster_prediction_score <- combined_integrated@meta.data %>%
+  mutate(cluster = as.character(seurat_clusters)) %>%
+  group_by(cluster) %>%
+  summarise(
+    n_cells = n(),
+    mean_score = mean(
+      predicted.celltype.l2.score,
+      na.rm = TRUE
+    ),
+    median_score = median(
+      predicted.celltype.l2.score,
+      na.rm = TRUE
+    ),
+    low_score_fraction = mean(
+      predicted.celltype.l2.score < 0.5,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  arrange(as.numeric(cluster))
+
+write.csv(
+  cluster_prediction_score,
+  file = "GSE207633_cluster_Azimuth_prediction_scores.csv",
+  row.names = FALSE
+)
+
+
+# FindMarkers
+DefaultAssay(combined_integrated) <- "RNA"
+
+combined_integrated <- JoinLayers(
+  object = combined_integrated,
+  assay = "RNA"
+)
+
+Idents(combined_integrated) <- "seurat_clusters"
+
+markers_all <- FindAllMarkers(
+  object = combined_integrated,
   assay = "RNA",
   slot = "data",
   only.pos = TRUE,
@@ -29,8 +195,6 @@ write.csv(
   row.names = FALSE
 )
 
-
-# Top10 markers for each cluster
 top10_markers <- markers_all %>%
   group_by(cluster) %>%
   slice_max(
@@ -44,4 +208,10 @@ write.csv(
   top10_markers,
   file = "GSE207633_top10_markers_per_cluster.csv",
   row.names = FALSE
+)
+
+# SaveRDS
+saveRDS(
+  combined_integrated,
+  file = "GSE207633_RPCA_Azimuth_annotated_res0.6.rds"
 )
