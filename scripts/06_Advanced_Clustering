@@ -1,0 +1,1284 @@
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(Azimuth)
+
+# ============================================================
+# 기본 설정
+# ============================================================
+
+DefaultAssay(combined_integrated) <- "RNA"
+
+combined_integrated <- JoinLayers(
+  object = combined_integrated,
+  assay = "RNA"
+)
+
+Idents(combined_integrated) <- "seurat_clusters"
+
+# 결과 저장 최상위 폴더
+output_dir <- "GSE207633_subclustering_results"
+
+dir.create(
+  output_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+# sample 정보를 담은 metadata column
+# 일반적으로 orig.ident이지만, 실제 데이터에서 다른 이름이면 수정
+sample_col <- "orig.ident"
+
+# Azimuth label 및 score column
+azimuth_label_col <- "predicted.celltype.l2"
+azimuth_score_col <- "predicted.celltype.l2.score"
+
+# 재분석할 ambiguous cluster
+ambiguous_clusters <- c(
+  9, 12, 14, 16, 20, 23, 30
+)
+
+# B-cell cluster
+# 반드시 기존 annotation 결과와 대조해서 수정
+b_clusters <- c(
+  7, 8, 21, 22, 28
+)
+
+# 비교할 resolution
+resolution_values <- c(
+  0.1, 0.2, 0.3, 0.4, 0.5, 0.6
+)
+
+# marker 분석에 우선 사용할 resolution
+# PDF를 확인한 뒤 필요하면 이 값만 수정하고 marker 부분을 재실행
+selected_resolutions <- c(
+  B = 0.3,
+  `9` = 0.3,
+  `12` = 0.3,
+  `14` = 0.3,
+  `16` = 0.3,
+  `20` = 0.3,
+  `23` = 0.3,
+  `30` = 0.2
+)
+
+colnames(combined_integrated@meta.data)
+
+table(
+  combined_integrated$seurat_clusters,
+  useNA = "ifany"
+)
+
+
+# 저장용 보조 함수 생성
+## PDF
+save_plot_pdf <- function(
+  plot_object,
+  filename,
+  width = 10,
+  height = 8
+) {
+
+  pdf(
+    file = filename,
+    width = width,
+    height = height,
+    onefile = TRUE
+  )
+
+  print(plot_object)
+
+  dev.off()
+}
+
+## resolution column 찾는 함수
+find_resolution_column <- function(
+  object,
+  resolution
+) {
+
+  metadata_columns <- colnames(object@meta.data)
+
+  resolution_text <- as.character(resolution)
+
+  candidate_columns <- metadata_columns[
+    grepl(
+      pattern = paste0(
+        "res\\.",
+        gsub("\\.", "\\\\.", resolution_text),
+        "$"
+      ),
+      x = metadata_columns
+    )
+  ]
+
+  if (length(candidate_columns) == 0) {
+    stop(
+      "Resolution column을 찾지 못했습니다: ",
+      resolution
+    )
+  }
+
+  candidate_columns[1]
+}
+
+## 안전하게 metadata column 확인
+existing_columns <- function(
+  object,
+  requested_columns
+) {
+
+  requested_columns[
+    requested_columns %in%
+      colnames(object@meta.data)
+  ]
+}
+
+# 재클러스터링 결과 저장 함수
+save_azimuth_reclustering_results <- function(
+  object,
+  analysis_name,
+  reduction_name,
+  output_directory,
+  resolution_values,
+  selected_resolution,
+  sample_col = "orig.ident",
+  azimuth_label_col = "predicted.celltype.l2",
+  azimuth_score_col = "predicted.celltype.l2.score"
+) {
+
+  analysis_dir <- file.path(
+    output_directory,
+    analysis_name
+  )
+
+  dir.create(
+    analysis_dir,
+    showWarnings = FALSE,
+    recursive = TRUE
+  )
+
+  # ==========================================================
+  # 1. 선택한 resolution column 확인
+  # ==========================================================
+
+  selected_resolution_column <- find_resolution_column(
+    object = object,
+    resolution = selected_resolution
+  )
+
+  message(
+    analysis_name,
+    " selected column: ",
+    selected_resolution_column
+  )
+
+  object$selected_subcluster <- as.character(
+    object@meta.data[
+      [selected_resolution_column]
+    ]
+  )
+
+  # ==========================================================
+  # 2. 재클러스터링 object 저장
+  # ==========================================================
+
+  saveRDS(
+    object,
+    file = file.path(
+      analysis_dir,
+      paste0(
+        analysis_name,
+        "_selected_res",
+        selected_resolution,
+        ".rds"
+      )
+    )
+  )
+
+  # ==========================================================
+  # 3. PCA elbow plot 저장
+  # ==========================================================
+
+  elbow_plot <- ElbowPlot(
+    object,
+    ndims = min(
+      30,
+      ncol(Embeddings(object, "pca"))
+    )
+  ) +
+    ggtitle(
+      paste0(
+        analysis_name,
+        " PCA elbow plot"
+      )
+    )
+
+  save_plot_pdf(
+    elbow_plot,
+    filename = file.path(
+      analysis_dir,
+      paste0(
+        analysis_name,
+        "_PCA_elbow_plot.pdf"
+      )
+    ),
+    width = 8,
+    height = 6
+  )
+
+  # ==========================================================
+  # 4. 여러 resolution UMAP 비교
+  # ==========================================================
+
+  resolution_plots <- list()
+
+  for (resolution in resolution_values) {
+
+    resolution_column <- tryCatch(
+      find_resolution_column(
+        object = object,
+        resolution = resolution
+      ),
+      error = function(e) NULL
+    )
+
+    if (!is.null(resolution_column)) {
+
+      resolution_plots[[
+        paste0("res_", resolution)
+      ]] <- DimPlot(
+        object,
+        reduction = reduction_name,
+        group.by = resolution_column,
+        label = TRUE,
+        repel = TRUE,
+        label.size = 4
+      ) +
+        ggtitle(
+          paste0(
+            analysis_name,
+            " | resolution ",
+            resolution
+          )
+        ) +
+        NoLegend()
+    }
+  }
+
+  resolution_comparison_plot <- wrap_plots(
+    resolution_plots,
+    ncol = 2
+  )
+
+  save_plot_pdf(
+    resolution_comparison_plot,
+    filename = file.path(
+      analysis_dir,
+      paste0(
+        analysis_name,
+        "_resolution_comparison_UMAP.pdf"
+      )
+    ),
+    width = 16,
+    height = 5 * ceiling(
+      length(resolution_plots) / 2
+    )
+  )
+
+  # ==========================================================
+  # 5. 선택한 resolution UMAP 저장
+  # ==========================================================
+
+  selected_subcluster_plot <- DimPlot(
+    object,
+    reduction = reduction_name,
+    group.by = "selected_subcluster",
+    label = TRUE,
+    repel = TRUE,
+    label.size = 4
+  ) +
+    ggtitle(
+      paste0(
+        analysis_name,
+        " | selected resolution = ",
+        selected_resolution
+      )
+    ) +
+    NoLegend()
+
+  save_plot_pdf(
+    selected_subcluster_plot,
+    filename = file.path(
+      analysis_dir,
+      paste0(
+        analysis_name,
+        "_selected_resolution_UMAP.pdf"
+      )
+    ),
+    width = 9,
+    height = 7
+  )
+
+  # ==========================================================
+  # 6. 세포별 Azimuth label UMAP
+  # ==========================================================
+
+  azimuth_cell_plot <- DimPlot(
+    object,
+    reduction = reduction_name,
+    group.by = azimuth_label_col,
+    label = TRUE,
+    repel = TRUE,
+    label.size = 3
+  ) +
+    ggtitle(
+      paste0(
+        analysis_name,
+        " | cell-level Azimuth labels"
+      )
+    ) +
+    NoLegend()
+
+  save_plot_pdf(
+    azimuth_cell_plot,
+    filename = file.path(
+      analysis_dir,
+      paste0(
+        analysis_name,
+        "_cell_level_Azimuth_UMAP.pdf"
+      )
+    ),
+    width = 11,
+    height = 8
+  )
+
+  # ==========================================================
+  # 7. Azimuth prediction score FeaturePlot
+  # ==========================================================
+
+  if (
+    azimuth_score_col %in%
+      colnames(object@meta.data)
+  ) {
+
+    azimuth_score_plot <- FeaturePlot(
+      object,
+      reduction = reduction_name,
+      features = azimuth_score_col
+    ) +
+      ggtitle(
+        paste0(
+          analysis_name,
+          " | Azimuth prediction score"
+        )
+      )
+
+    save_plot_pdf(
+      azimuth_score_plot,
+      filename = file.path(
+        analysis_dir,
+        paste0(
+          analysis_name,
+          "_Azimuth_prediction_score.pdf"
+        )
+      ),
+      width = 9,
+      height = 7
+    )
+  }
+
+  # ==========================================================
+  # 8. 선택 subcluster별 Azimuth label 구성
+  # ==========================================================
+
+  azimuth_composition <- object@meta.data %>%
+    mutate(
+      selected_subcluster =
+        as.character(selected_subcluster),
+      azimuth_label =
+        .data[[azimuth_label_col]]
+    ) %>%
+    count(
+      selected_subcluster,
+      azimuth_label,
+      name = "n"
+    ) %>%
+    group_by(selected_subcluster) %>%
+    mutate(
+      total_cells = sum(n),
+      proportion = n / total_cells
+    ) %>%
+    arrange(
+      as.numeric(selected_subcluster),
+      desc(proportion)
+    ) %>%
+    ungroup()
+
+  write.csv(
+    azimuth_composition,
+    file = file.path(
+      analysis_dir,
+      paste0(
+        analysis_name,
+        "_subcluster_Azimuth_full_distribution.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+  # ==========================================================
+  # 9. 각 subcluster의 대표 Azimuth label 선정
+  # ==========================================================
+
+  subcluster_annotation <- azimuth_composition %>%
+    group_by(selected_subcluster) %>%
+    slice_max(
+      order_by = n,
+      n = 1,
+      with_ties = FALSE
+    ) %>%
+    ungroup() %>%
+    arrange(
+      as.numeric(selected_subcluster)
+    ) %>%
+    rename(
+      representative_Azimuth_label =
+        azimuth_label,
+      representative_n = n,
+      representative_proportion =
+        proportion
+    )
+
+  write.csv(
+    subcluster_annotation,
+    file = file.path(
+      analysis_dir,
+      paste0(
+        analysis_name,
+        "_subcluster_Azimuth_annotation.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+  # ==========================================================
+  # 10. 대표 label을 각 세포에 입력
+  # ==========================================================
+
+  subcluster_to_label <- setNames(
+    subcluster_annotation$
+      representative_Azimuth_label,
+    subcluster_annotation$
+      selected_subcluster
+  )
+
+  object$subcluster_Azimuth_label <- unname(
+    subcluster_to_label[
+      as.character(
+        object$selected_subcluster
+      )
+    ]
+  )
+
+  # ==========================================================
+  # 11. 대표 Azimuth label UMAP 저장
+  # ==========================================================
+
+  representative_label_plot <- DimPlot(
+    object,
+    reduction = reduction_name,
+    group.by = "subcluster_Azimuth_label",
+    label = TRUE,
+    repel = TRUE,
+    label.size = 4
+  ) +
+    ggtitle(
+      paste0(
+        analysis_name,
+        " | subcluster representative Azimuth label"
+      )
+    ) +
+    NoLegend()
+
+  save_plot_pdf(
+    representative_label_plot,
+    filename = file.path(
+      analysis_dir,
+      paste0(
+        analysis_name,
+        "_subcluster_representative_Azimuth_UMAP.pdf"
+      )
+    ),
+    width = 10,
+    height = 8
+  )
+
+  # ==========================================================
+  # 12. Subcluster 번호와 대표 label을 같이 표시
+  # ==========================================================
+
+  object$subcluster_label_combined <- paste0(
+    object$selected_subcluster,
+    "_",
+    object$subcluster_Azimuth_label
+  )
+
+  combined_label_plot <- DimPlot(
+    object,
+    reduction = reduction_name,
+    group.by = "subcluster_label_combined",
+    label = TRUE,
+    repel = TRUE,
+    label.size = 3
+  ) +
+    ggtitle(
+      paste0(
+        analysis_name,
+        " | subcluster + Azimuth label"
+      )
+    ) +
+    NoLegend()
+
+  save_plot_pdf(
+    combined_label_plot,
+    filename = file.path(
+      analysis_dir,
+      paste0(
+        analysis_name,
+        "_subcluster_number_and_Azimuth_UMAP.pdf"
+      )
+    ),
+    width = 11,
+    height = 8
+  )
+
+  # ==========================================================
+  # 13. Subcluster별 prediction score
+  # ==========================================================
+
+  if (
+    azimuth_score_col %in%
+      colnames(object@meta.data)
+  ) {
+
+    prediction_score_summary <-
+      object@meta.data %>%
+      mutate(
+        selected_subcluster =
+          as.character(selected_subcluster)
+      ) %>%
+      group_by(selected_subcluster) %>%
+      summarise(
+        n_cells = n(),
+        mean_score = mean(
+          .data[[azimuth_score_col]],
+          na.rm = TRUE
+        ),
+        median_score = median(
+          .data[[azimuth_score_col]],
+          na.rm = TRUE
+        ),
+        min_score = min(
+          .data[[azimuth_score_col]],
+          na.rm = TRUE
+        ),
+        max_score = max(
+          .data[[azimuth_score_col]],
+          na.rm = TRUE
+        ),
+        low_score_fraction_below_0.5 =
+          mean(
+            .data[[azimuth_score_col]] <
+              0.5,
+            na.rm = TRUE
+          ),
+        low_score_fraction_below_0.6 =
+          mean(
+            .data[[azimuth_score_col]] <
+              0.6,
+            na.rm = TRUE
+          ),
+        .groups = "drop"
+      ) %>%
+      arrange(
+        as.numeric(selected_subcluster)
+      )
+
+    write.csv(
+      prediction_score_summary,
+      file = file.path(
+        analysis_dir,
+        paste0(
+          analysis_name,
+          "_subcluster_prediction_scores.csv"
+        )
+      ),
+      row.names = FALSE
+    )
+  }
+
+  # ==========================================================
+  # 14. Sample별 subcluster 분포
+  # ==========================================================
+
+  if (
+    sample_col %in%
+      colnames(object@meta.data)
+  ) {
+
+    sample_distribution <-
+      object@meta.data %>%
+      mutate(
+        selected_subcluster =
+          as.character(selected_subcluster),
+        sample =
+          .data[[sample_col]]
+      ) %>%
+      count(
+        selected_subcluster,
+        sample,
+        name = "n"
+      ) %>%
+      group_by(selected_subcluster) %>%
+      mutate(
+        total_cells = sum(n),
+        proportion = n / total_cells
+      ) %>%
+      arrange(
+        as.numeric(selected_subcluster),
+        desc(proportion)
+      ) %>%
+      ungroup()
+
+    write.csv(
+      sample_distribution,
+      file = file.path(
+        analysis_dir,
+        paste0(
+          analysis_name,
+          "_subcluster_sample_distribution.csv"
+        )
+      ),
+      row.names = FALSE
+    )
+  }
+
+  # ==========================================================
+  # 15. QC summary 및 violin plot
+  # ==========================================================
+
+  qc_features <- c(
+    "nCount_RNA",
+    "nFeature_RNA",
+    "percent.mt"
+  )
+
+  qc_features <- qc_features[
+    qc_features %in%
+      colnames(object@meta.data)
+  ]
+
+  if (length(qc_features) > 0) {
+
+    qc_summary <- object@meta.data %>%
+      mutate(
+        selected_subcluster =
+          as.character(selected_subcluster)
+      ) %>%
+      group_by(selected_subcluster) %>%
+      summarise(
+        across(
+          all_of(qc_features),
+          list(
+            mean = ~ mean(
+              .x,
+              na.rm = TRUE
+            ),
+            median = ~ median(
+              .x,
+              na.rm = TRUE
+            )
+          )
+        ),
+        n_cells = n(),
+        .groups = "drop"
+      )
+
+    write.csv(
+      qc_summary,
+      file = file.path(
+        analysis_dir,
+        paste0(
+          analysis_name,
+          "_subcluster_QC_summary.csv"
+        )
+      ),
+      row.names = FALSE
+    )
+
+    qc_plot <- VlnPlot(
+      object,
+      features = qc_features,
+      group.by = "selected_subcluster",
+      pt.size = 0,
+      ncol = length(qc_features)
+    )
+
+    save_plot_pdf(
+      qc_plot,
+      filename = file.path(
+        analysis_dir,
+        paste0(
+          analysis_name,
+          "_subcluster_QC_violin.pdf"
+        )
+      ),
+      width = 5 * length(qc_features),
+      height = 6
+    )
+  }
+
+  # ==========================================================
+  # 16. Cell-level metadata 저장
+  # ==========================================================
+
+  cell_metadata <- object@meta.data %>%
+    mutate(
+      cell_barcode =
+        rownames(object@meta.data)
+    )
+
+  write.csv(
+    cell_metadata,
+    file = file.path(
+      analysis_dir,
+      paste0(
+        analysis_name,
+        "_cell_metadata.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+  # ==========================================================
+  # 17. 최종 object 재저장
+  # ==========================================================
+
+  saveRDS(
+    object,
+    file = file.path(
+      analysis_dir,
+      paste0(
+        analysis_name,
+        "_Azimuth_annotated_selected_res",
+        selected_resolution,
+        ".rds"
+      )
+    )
+  )
+
+  return(object)
+}
+
+# 개별 cluster 재클러스터링 함수
+recluster_single_cluster <- function(
+  object,
+  cluster_id,
+  dims_use = 1:15,
+  resolutions = c(
+    0.1, 0.2, 0.3, 0.4, 0.5, 0.6
+  ),
+  nfeatures = 2000
+) {
+
+  Idents(object) <- "seurat_clusters"
+
+  sub_obj <- subset(
+    object,
+    idents = as.character(cluster_id)
+  )
+
+  message(
+    "Cluster ",
+    cluster_id,
+    ": ",
+    ncol(sub_obj),
+    " cells"
+  )
+
+  DefaultAssay(sub_obj) <- "RNA"
+
+  sub_obj <- JoinLayers(
+    object = sub_obj,
+    assay = "RNA"
+  )
+
+  sub_obj <- NormalizeData(
+    sub_obj,
+    verbose = FALSE
+  )
+
+  sub_obj <- FindVariableFeatures(
+    sub_obj,
+    selection.method = "vst",
+    nfeatures = min(
+      nfeatures,
+      nrow(sub_obj)
+    ),
+    verbose = FALSE
+  )
+
+  sub_obj <- ScaleData(
+    sub_obj,
+    verbose = FALSE
+  )
+
+  sub_obj <- RunPCA(
+    sub_obj,
+    npcs = max(dims_use),
+    verbose = FALSE
+  )
+
+  sub_obj <- FindNeighbors(
+    sub_obj,
+    dims = dims_use,
+    verbose = FALSE
+  )
+
+  sub_obj <- FindClusters(
+    sub_obj,
+    resolution = resolutions,
+    algorithm = 1,
+    verbose = FALSE
+  )
+
+  reduction_name <- paste0(
+    "cluster",
+    cluster_id,
+    "_umap"
+  )
+
+  sub_obj <- RunUMAP(
+    sub_obj,
+    dims = dims_use,
+    reduction.name = reduction_name,
+    reduction.key = paste0(
+      "C",
+      cluster_id,
+      "UMAP_"
+    ),
+    verbose = FALSE
+  )
+
+  return(sub_obj)
+}
+
+
+# B cell subset 생성
+b_clusters <- c(
+  7, 8, 21, 22, 28
+)
+
+Idents(combined_integrated) <- "seurat_clusters"
+
+b_obj <- subset(
+  combined_integrated,
+  idents = as.character(b_clusters)
+)
+
+message(
+  "B-cell subset cell number: ",
+  ncol(b_obj)
+)
+
+# B cell 재클러스터링
+DefaultAssay(b_obj) <- "RNA"
+
+b_obj <- JoinLayers(
+  object = b_obj,
+  assay = "RNA"
+)
+
+b_obj <- NormalizeData(
+  b_obj,
+  verbose = FALSE
+)
+
+b_obj <- FindVariableFeatures(
+  b_obj,
+  selection.method = "vst",
+  nfeatures = 3000,
+  verbose = FALSE
+)
+
+b_obj <- ScaleData(
+  b_obj,
+  verbose = FALSE
+)
+
+b_obj <- RunPCA(
+  b_obj,
+  npcs = 30,
+  verbose = FALSE
+)
+
+b_obj <- FindNeighbors(
+  b_obj,
+  dims = 1:20,
+  verbose = FALSE
+)
+
+b_obj <- FindClusters(
+  b_obj,
+  resolution = resolution_values,
+  algorithm = 1,
+  verbose = FALSE
+)
+
+b_obj <- RunUMAP(
+  b_obj,
+  dims = 1:20,
+  reduction.name = "b_umap",
+  reduction.key = "bUMAP_",
+  verbose = FALSE
+)
+
+# B-cell 결과 저장 및 Azimuth labeling
+b_obj <- save_azimuth_reclustering_results(
+  object = b_obj,
+  analysis_name = "B_cell_reclustering",
+  reduction_name = "b_umap",
+  output_directory = output_dir,
+  resolution_values = resolution_values,
+  selected_resolution = 0.3,
+  sample_col = sample_col,
+  azimuth_label_col = azimuth_label_col,
+  azimuth_score_col = azimuth_score_col
+)
+
+# T-cell 재클러스터링
+cluster9_obj <- recluster_single_cluster(
+  object = combined_integrated,
+  cluster_id = 9,
+  dims_use = 1:15,
+  resolutions = resolution_values,
+  nfeatures = 2000
+)
+
+cluster9_obj <- save_azimuth_reclustering_results(
+  object = cluster9_obj,
+  analysis_name = "cluster9_reclustering",
+  reduction_name = "cluster9_umap",
+  output_directory = output_dir,
+  resolution_values = resolution_values,
+  selected_resolution = 0.3,
+  sample_col = sample_col,
+  azimuth_label_col = azimuth_label_col,
+  azimuth_score_col = azimuth_score_col
+)
+
+cluster12_obj <- recluster_single_cluster(
+  object = combined_integrated,
+  cluster_id = 12,
+  dims_use = 1:15,
+  resolutions = resolution_values,
+  nfeatures = 2000
+)
+
+cluster12_obj <- save_azimuth_reclustering_results(
+  object = cluster12_obj,
+  analysis_name = "cluster12_reclustering",
+  reduction_name = "cluster12_umap",
+  output_directory = output_dir,
+  resolution_values = resolution_values,
+  selected_resolution = 0.3,
+  sample_col = sample_col,
+  azimuth_label_col = azimuth_label_col,
+  azimuth_score_col = azimuth_score_col
+)
+
+cluster14_obj <- recluster_single_cluster(
+  object = combined_integrated,
+  cluster_id = 14,
+  dims_use = 1:15,
+  resolutions = resolution_values,
+  nfeatures = 2000
+)
+
+cluster14_obj <- save_azimuth_reclustering_results(
+  object = cluster14_obj,
+  analysis_name = "cluster14_reclustering",
+  reduction_name = "cluster14_umap",
+  output_directory = output_dir,
+  resolution_values = resolution_values,
+  selected_resolution = 0.3,
+  sample_col = sample_col,
+  azimuth_label_col = azimuth_label_col,
+  azimuth_score_col = azimuth_score_col
+)
+
+cluster16_obj <- recluster_single_cluster(
+  object = combined_integrated,
+  cluster_id = 16,
+  dims_use = 1:15,
+  resolutions = resolution_values,
+  nfeatures = 2000
+)
+
+cluster16_obj <- save_azimuth_reclustering_results(
+  object = cluster16_obj,
+  analysis_name = "cluster16_reclustering",
+  reduction_name = "cluster16_umap",
+  output_directory = output_dir,
+  resolution_values = resolution_values,
+  selected_resolution = 0.3,
+  sample_col = sample_col,
+  azimuth_label_col = azimuth_label_col,
+  azimuth_score_col = azimuth_score_col
+)
+
+cluster20_obj <- recluster_single_cluster(
+  object = combined_integrated,
+  cluster_id = 20,
+  dims_use = 1:15,
+  resolutions = resolution_values,
+  nfeatures = 2000
+)
+
+cluster20_obj <- save_azimuth_reclustering_results(
+  object = cluster20_obj,
+  analysis_name = "cluster20_reclustering",
+  reduction_name = "cluster20_umap",
+  output_directory = output_dir,
+  resolution_values = resolution_values,
+  selected_resolution = 0.3,
+  sample_col = sample_col,
+  azimuth_label_col = azimuth_label_col,
+  azimuth_score_col = azimuth_score_col
+)
+
+cluster23_obj <- recluster_single_cluster(
+  object = combined_integrated,
+  cluster_id = 23,
+  dims_use = 1:15,
+  resolutions = resolution_values,
+  nfeatures = 2000
+)
+
+cluster23_obj <- save_azimuth_reclustering_results(
+  object = cluster23_obj,
+  analysis_name = "cluster23_reclustering",
+  reduction_name = "cluster23_umap",
+  output_directory = output_dir,
+  resolution_values = resolution_values,
+  selected_resolution = 0.3,
+  sample_col = sample_col,
+  azimuth_label_col = azimuth_label_col,
+  azimuth_score_col = azimuth_score_col
+)
+
+cluster30_resolutions <- c(
+  0.1,
+  0.2,
+  0.3,
+  0.4
+)
+
+cluster30_obj <- recluster_single_cluster(
+  object = combined_integrated,
+  cluster_id = 30,
+  dims_use = 1:10,
+  resolutions = cluster30_resolutions,
+  nfeatures = 1500
+)
+
+cluster30_obj <- save_azimuth_reclustering_results(
+  object = cluster30_obj,
+  analysis_name = "cluster30_reclustering",
+  reduction_name = "cluster30_umap",
+  output_directory = output_dir,
+  resolution_values = cluster30_resolutions,
+  selected_resolution = 0.2,
+  sample_col = sample_col,
+  azimuth_label_col = azimuth_label_col,
+  azimuth_score_col = azimuth_score_col
+)
+
+
+# 모든 재클러스터링 결과 저장
+all_reclustered_objects <- list(
+  B_cell = b_obj,
+  cluster9 = cluster9_obj,
+  cluster12 = cluster12_obj,
+  cluster14 = cluster14_obj,
+  cluster16 = cluster16_obj,
+  cluster20 = cluster20_obj,
+  cluster23 = cluster23_obj,
+  cluster30 = cluster30_obj
+)
+
+saveRDS(
+  all_reclustered_objects,
+  file = file.path(
+    output_dir,
+    "GSE207633_all_Azimuth_reclustered_objects.rds"
+  )
+)
+
+# 최종 label 원본 object에 반영
+combined_integrated$final_celltype <-
+  combined_integrated$cluster_celltype
+
+combined_integrated$final_celltype[
+  colnames(b_obj)
+] <- b_obj$subcluster_Azimuth_label
+
+combined_integrated$final_celltype[
+  colnames(cluster9_obj)
+] <- cluster9_obj$subcluster_Azimuth_label
+
+combined_integrated$final_celltype[
+  colnames(cluster12_obj)
+] <- cluster12_obj$subcluster_Azimuth_label
+
+combined_integrated$final_celltype[
+  colnames(cluster14_obj)
+] <- cluster14_obj$subcluster_Azimuth_label
+
+combined_integrated$final_celltype[
+  colnames(cluster16_obj)
+] <- cluster16_obj$subcluster_Azimuth_label
+
+combined_integrated$final_celltype[
+  colnames(cluster20_obj)
+] <- cluster20_obj$subcluster_Azimuth_label
+
+combined_integrated$final_celltype[
+  colnames(cluster23_obj)
+] <- cluster23_obj$subcluster_Azimuth_label
+
+combined_integrated$final_celltype[
+  colnames(cluster30_obj)
+] <- cluster30_obj$subcluster_Azimuth_label
+
+table(
+  combined_integrated$final_celltype,
+  useNA = "ifany"
+)
+
+final_umap_plot <- DimPlot(
+  combined_integrated,
+  reduction = "umap",
+  group.by = "final_celltype",
+  label = TRUE,
+  repel = TRUE,
+  label.size = 3
+) +
+  ggtitle(
+    "GSE207633 final Azimuth annotation"
+  ) +
+  NoLegend()
+
+save_plot_pdf(
+  final_umap_plot,
+  filename = file.path(
+    output_dir,
+    "GSE207633_final_Azimuth_annotation_UMAP.pdf"
+  ),
+  width = 13,
+  height = 10
+)
+
+final_cell_annotation <- combined_integrated@meta.data %>%
+  mutate(
+    cell_barcode =
+      rownames(combined_integrated@meta.data)
+  ) %>%
+  select(
+    cell_barcode,
+    orig.ident,
+    seurat_clusters,
+    predicted.celltype.l2,
+    predicted.celltype.l2.score,
+    cluster_celltype,
+    final_celltype
+  )
+
+write.csv(
+  final_cell_annotation,
+  file = file.path(
+    output_dir,
+    "GSE207633_final_cell_level_Azimuth_annotation.csv"
+  ),
+  row.names = FALSE
+)
+
+saveRDS(
+  combined_integrated,
+  file = file.path(
+    output_dir,
+    "GSE207633_RPCA_Azimuth_reclustered_final.rds"
+  )
+)
+
+
+# ============================================================
+# 최종 celltype별 Azimuth 대표 label proportion 및 score
+# ============================================================
+
+final_annotation_summary <- combined_integrated@meta.data %>%
+  mutate(
+    final_celltype = as.character(final_celltype),
+    azimuth_label = as.character(predicted.celltype.l2)
+  ) %>%
+  count(
+    final_celltype,
+    azimuth_label,
+    name = "n"
+  ) %>%
+  group_by(final_celltype) %>%
+  mutate(
+    total_cells = sum(n),
+    proportion = n / total_cells
+  ) %>%
+  arrange(
+    final_celltype,
+    desc(proportion)
+  ) %>%
+  ungroup()
+
+write.csv(
+  final_annotation_summary,
+  file = file.path(
+    output_dir,
+    "GSE207633_final_celltype_Azimuth_full_distribution.csv"
+  ),
+  row.names = FALSE
+)
+
+final_annotation_top <- final_annotation_summary %>%
+  group_by(final_celltype) %>%
+  slice_max(
+    order_by = n,
+    n = 1,
+    with_ties = FALSE
+  ) %>%
+  ungroup() %>%
+  rename(
+    representative_Azimuth_label = azimuth_label,
+    representative_n = n,
+    representative_proportion = proportion
+  )
+
+write.csv(
+  final_annotation_top,
+  file = file.path(
+    output_dir,
+    "GSE207633_final_celltype_Azimuth_annotation_summary.csv"
+  ),
+  row.names = FALSE
+)
+
+final_annotation_top
