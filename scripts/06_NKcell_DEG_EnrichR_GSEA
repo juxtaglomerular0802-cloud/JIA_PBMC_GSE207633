@@ -1,0 +1,1164 @@
+library(Seurat)
+library(dplyr)
+library(tibble)
+library(stringr)
+library(enrichR)
+
+
+nk_cytotoxic <- subset(
+  combined_integrated,
+  subset = predicted.celltype.l2 == "NK"
+)
+
+
+##############################
+# 1. Basic settings
+##############################
+
+output_root <- path.expand(
+  "~/GSE207633_subclustering_results/NK_five_group_comparisons"
+)
+
+dir.create(
+  output_root,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# Metadata column containing the five groups
+group_column <- "Group"
+
+# Expected exact group names
+expected_groups <- c(
+  "Healthy",
+  "Inactive",
+  "Active",
+  "MAS",
+  "LungDisease"
+)
+
+# DEG significance thresholds
+deg_adj_p_cutoff <- 0.05
+deg_log2fc_cutoff <- 0.25
+
+# Relaxed threshold for sensitivity enrichment
+relaxed_adj_p_cutoff <- 0.05
+relaxed_log2fc_cutoff <- 0.10
+
+# Minimum number of genes required before Enrichr is attempted
+minimum_enrichr_genes <- 5
+
+
+##############################
+# 2. Check group labels
+##############################
+
+if (!group_column %in% colnames(nk_cytotoxic@meta.data)) {
+  stop(
+    paste0(
+      "Metadata column '",
+      group_column,
+      "' was not found."
+    )
+  )
+}
+
+cat("\nCurrent group distribution:\n")
+
+group_distribution <- as.data.frame(
+  table(nk_cytotoxic@meta.data[[group_column]])
+)
+
+colnames(group_distribution) <- c("Group", "Number_of_cells")
+
+print(group_distribution)
+
+write.csv(
+  group_distribution,
+  file.path(output_root, "NK_group_cell_counts.csv"),
+  row.names = FALSE
+)
+
+current_groups <- unique(
+  as.character(nk_cytotoxic@meta.data[[group_column]])
+)
+
+missing_groups <- setdiff(
+  expected_groups,
+  current_groups
+)
+
+if (length(missing_groups) > 0) {
+  warning(
+    paste0(
+      "These expected groups were not found: ",
+      paste(missing_groups, collapse = ", "),
+      "\nCheck the exact spelling in nk_cytotoxic$Group."
+    )
+  )
+}
+
+
+##############################
+# 3. Prepare RNA assay
+##############################
+
+DefaultAssay(nk_cytotoxic) <- "RNA"
+
+# Seurat v5: merge split RNA layers
+if (length(Layers(nk_cytotoxic[["RNA"]])) > 1) {
+
+  cat("\nJoining RNA layers...\n")
+
+  nk_cytotoxic[["RNA"]] <- JoinLayers(
+    nk_cytotoxic[["RNA"]]
+  )
+}
+
+cat("\nRNA layers after JoinLayers:\n")
+print(Layers(nk_cytotoxic[["RNA"]]))
+
+
+##############################
+# 4. Define all contrasts
+##############################
+
+# Positive avg_log2FC means higher in numerator.
+#
+# Core comparisons:
+#   Active vs Inactive
+#   MAS vs Active
+#   LungDisease vs Inactive
+#   LungDisease vs Active
+#
+# Healthy-control reference comparisons:
+#   Active vs Healthy
+#   Inactive vs Healthy
+#   MAS vs Healthy
+#   LungDisease vs Healthy
+#
+# Secondary pooled comparison:
+#   LungDisease vs Active + Inactive
+#
+# The pooled non-LD comparison excludes Healthy and MAS.
+
+contrast_list <- list(
+
+  Active_vs_Inactive = list(
+    numerator = "Active",
+    denominator = "Inactive",
+    category = "Primary_activity"
+  ),
+
+  MAS_vs_Active = list(
+    numerator = "MAS",
+    denominator = "Active",
+    category = "Primary_MAS"
+  ),
+
+  LungDisease_vs_Inactive = list(
+    numerator = "LungDisease",
+    denominator = "Inactive",
+    category = "Primary_LD"
+  ),
+
+  LungDisease_vs_Active = list(
+    numerator = "LungDisease",
+    denominator = "Active",
+    category = "Primary_LD"
+  ),
+
+  Active_vs_Healthy = list(
+    numerator = "Active",
+    denominator = "Healthy",
+    category = "Secondary_healthy_reference"
+  ),
+
+  Inactive_vs_Healthy = list(
+    numerator = "Inactive",
+    denominator = "Healthy",
+    category = "Secondary_healthy_reference"
+  ),
+
+  MAS_vs_Healthy = list(
+    numerator = "MAS",
+    denominator = "Healthy",
+    category = "Secondary_healthy_reference"
+  ),
+
+  LungDisease_vs_Healthy = list(
+    numerator = "LungDisease",
+    denominator = "Healthy",
+    category = "Secondary_healthy_reference"
+  ),
+
+  LungDisease_vs_nonLD_sJIA = list(
+    numerator = "LungDisease",
+    denominator = c("Inactive", "Active"),
+    category = "Exploratory_pooled"
+  )
+)
+
+
+##############################
+# 5. Save contrast definition
+##############################
+
+contrast_table <- bind_rows(
+  lapply(
+    names(contrast_list),
+    function(contrast_name) {
+
+      contrast_info <- contrast_list[[contrast_name]]
+
+      data.frame(
+        contrast = contrast_name,
+        numerator = paste(
+          contrast_info$numerator,
+          collapse = "+"
+        ),
+        denominator = paste(
+          contrast_info$denominator,
+          collapse = "+"
+        ),
+        category = contrast_info$category,
+        stringsAsFactors = FALSE
+      )
+    }
+  )
+)
+
+write.csv(
+  contrast_table,
+  file.path(output_root, "NK_contrast_definitions.csv"),
+  row.names = FALSE
+)
+
+print(contrast_table)
+
+
+##############################
+# 6. Select available Enrichr databases
+##############################
+
+available_dbs <- listEnrichrDbs()
+
+write.csv(
+  available_dbs,
+  file.path(output_root, "Available_Enrichr_databases.csv"),
+  row.names = FALSE
+)
+
+available_db_names <- available_dbs$libraryName
+
+
+# Function selecting exact or latest available DB
+select_enrichr_database <- function(
+    preferred_name,
+    search_pattern,
+    available_names
+) {
+
+  if (preferred_name %in% available_names) {
+    return(preferred_name)
+  }
+
+  candidates <- available_names[
+    grepl(
+      search_pattern,
+      available_names,
+      ignore.case = TRUE
+    )
+  ]
+
+  if (length(candidates) == 0) {
+    return(NA_character_)
+  }
+
+  # Extract the latest apparent year
+  candidate_year <- suppressWarnings(
+    as.numeric(
+      str_extract(candidates, "(19|20)[0-9]{2}")
+    )
+  )
+
+  if (all(is.na(candidate_year))) {
+    return(candidates[1])
+  }
+
+  candidates[
+    which.max(
+      ifelse(
+        is.na(candidate_year),
+        -Inf,
+        candidate_year
+      )
+    )
+  ]
+}
+
+
+hallmark_db <- select_enrichr_database(
+  preferred_name = "MSigDB_Hallmark_2020",
+  search_pattern = "MSigDB.*Hallmark|Hallmark",
+  available_names = available_db_names
+)
+
+go_bp_db <- select_enrichr_database(
+  preferred_name = "GO_Biological_Process_2026",
+  search_pattern = "GO_Biological_Process",
+  available_names = available_db_names
+)
+
+reactome_db <- select_enrichr_database(
+  preferred_name = "Reactome_Pathways_2024",
+  search_pattern = "Reactome",
+  available_names = available_db_names
+)
+
+kegg_db <- select_enrichr_database(
+  preferred_name = "KEGG_2021_Human",
+  search_pattern = "KEGG.*Human",
+  available_names = available_db_names
+)
+
+dbs <- unique(
+  na.omit(
+    c(
+      hallmark_db,
+      go_bp_db,
+      reactome_db,
+      kegg_db
+    )
+  )
+)
+
+cat("\nEnrichr databases selected:\n")
+print(dbs)
+
+write.csv(
+  data.frame(database = dbs),
+  file.path(output_root, "Selected_Enrichr_databases.csv"),
+  row.names = FALSE
+)
+
+if (length(dbs) == 0) {
+  warning(
+    paste0(
+      "No requested Enrichr databases were found. ",
+      "DEG and RNK files will still be generated."
+    )
+  )
+}
+
+
+##############################
+# 7. Helper function:
+#    Enrichr analysis and saving
+##############################
+
+run_and_save_enrichr <- function(
+    gene_list,
+    contrast_name,
+    direction_name,
+    cutoff_name,
+    contrast_dir,
+    databases
+) {
+
+  gene_list <- unique(
+    gene_list[
+      !is.na(gene_list) &
+        gene_list != ""
+    ]
+  )
+
+  gene_list_file <- file.path(
+    contrast_dir,
+    paste0(
+      contrast_name,
+      "_",
+      direction_name,
+      "_",
+      cutoff_name,
+      "_gene_list.txt"
+    )
+  )
+
+  writeLines(
+    gene_list,
+    con = gene_list_file
+  )
+
+  if (length(gene_list) < minimum_enrichr_genes) {
+
+    message(
+      contrast_name,
+      " / ",
+      direction_name,
+      " / ",
+      cutoff_name,
+      ": only ",
+      length(gene_list),
+      " genes; Enrichr skipped."
+    )
+
+    return(NULL)
+  }
+
+  if (length(databases) == 0) {
+    message("No Enrichr database available.")
+    return(NULL)
+  }
+
+  enrich_result <- tryCatch(
+
+    enrichr(
+      genes = gene_list,
+      databases = databases
+    ),
+
+    error = function(e) {
+
+      message(
+        "Enrichr failed for ",
+        contrast_name,
+        " / ",
+        direction_name,
+        ": ",
+        conditionMessage(e)
+      )
+
+      return(NULL)
+    }
+  )
+
+  if (is.null(enrich_result)) {
+    return(NULL)
+  }
+
+  enrich_dir <- file.path(
+    contrast_dir,
+    paste0(
+      "Enrichr_",
+      cutoff_name
+    )
+  )
+
+  dir.create(
+    enrich_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+  for (db_name in names(enrich_result)) {
+
+    db_result <- enrich_result[[db_name]]
+
+    if (is.null(db_result)) {
+      next
+    }
+
+    if (nrow(db_result) > 0) {
+
+      if ("Adjusted.P.value" %in% colnames(db_result)) {
+        db_result <- db_result %>%
+          arrange(Adjusted.P.value, P.value)
+      }
+
+      db_result$Contrast <- contrast_name
+      db_result$Direction <- direction_name
+      db_result$Cutoff <- cutoff_name
+      db_result$Database <- db_name
+      db_result$Input_gene_count <- length(gene_list)
+    }
+
+    safe_db_name <- str_replace_all(
+      db_name,
+      "[^A-Za-z0-9_-]",
+      "_"
+    )
+
+    write.csv(
+      db_result,
+      file.path(
+        enrich_dir,
+        paste0(
+          "Enrichr_",
+          contrast_name,
+          "_",
+          direction_name,
+          "_",
+          safe_db_name,
+          ".csv"
+        )
+      ),
+      row.names = FALSE
+    )
+  }
+
+  return(enrich_result)
+}
+
+
+##############################
+# 8. Helper function:
+#    Create GSEA RNK file
+##############################
+
+create_gsea_rnk <- function(
+    deg_table,
+    contrast_name,
+    contrast_dir
+) {
+
+  # Main rank metric:
+  # positive = numerator-up
+  # negative = denominator-up
+  #
+  # For exploratory Seurat DEG, avg_log2FC is used because
+  # Wilcoxon FindMarkers does not return a conventional
+  # model-based test statistic.
+
+  rnk_table <- deg_table %>%
+    filter(
+      !is.na(gene),
+      gene != "",
+      !is.na(avg_log2FC),
+      is.finite(avg_log2FC)
+    ) %>%
+    group_by(gene) %>%
+    slice_max(
+      order_by = abs(avg_log2FC),
+      n = 1,
+      with_ties = FALSE
+    ) %>%
+    ungroup() %>%
+    transmute(
+      gene = gene,
+      rank_score = avg_log2FC
+    ) %>%
+    arrange(desc(rank_score))
+
+  # GSEA preranked files are commonly stored as:
+  # gene<TAB>score
+  # without row names.
+  write.table(
+    rnk_table,
+    file = file.path(
+      contrast_dir,
+      paste0(
+        contrast_name,
+        "_avg_log2FC.rnk"
+      )
+    ),
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = FALSE
+  )
+
+  # Also save a readable CSV version
+  write.csv(
+    rnk_table,
+    file.path(
+      contrast_dir,
+      paste0(
+        contrast_name,
+        "_GSEA_ranked_genes.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+  return(rnk_table)
+}
+
+
+##############################
+# 9. Main comparison function
+##############################
+
+run_one_contrast <- function(
+    seurat_object,
+    contrast_name,
+    contrast_info
+) {
+
+  numerator_groups <- contrast_info$numerator
+  denominator_groups <- contrast_info$denominator
+  contrast_category <- contrast_info$category
+
+  cat(
+    "\n\n============================================\n",
+    "Running contrast: ",
+    contrast_name,
+    "\nNumerator: ",
+    paste(numerator_groups, collapse = " + "),
+    "\nDenominator: ",
+    paste(denominator_groups, collapse = " + "),
+    "\n============================================\n",
+    sep = ""
+  )
+
+  contrast_dir <- file.path(
+    output_root,
+    contrast_category,
+    contrast_name
+  )
+
+  dir.create(
+    contrast_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+  metadata_groups <- as.character(
+    seurat_object@meta.data[[group_column]]
+  )
+
+  cells_numerator <- colnames(seurat_object)[
+    metadata_groups %in% numerator_groups
+  ]
+
+  cells_denominator <- colnames(seurat_object)[
+    metadata_groups %in% denominator_groups
+  ]
+
+  cell_count_table <- data.frame(
+    Contrast = contrast_name,
+    Category = contrast_category,
+    Side = c("Numerator", "Denominator"),
+    Groups = c(
+      paste(numerator_groups, collapse = "+"),
+      paste(denominator_groups, collapse = "+")
+    ),
+    Number_of_cells = c(
+      length(cells_numerator),
+      length(cells_denominator)
+    ),
+    stringsAsFactors = FALSE
+  )
+
+  write.csv(
+    cell_count_table,
+    file.path(
+      contrast_dir,
+      paste0(
+        contrast_name,
+        "_cell_counts.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+  if (length(cells_numerator) < 3) {
+    warning(
+      contrast_name,
+      ": fewer than 3 numerator cells; skipped."
+    )
+    return(NULL)
+  }
+
+  if (length(cells_denominator) < 3) {
+    warning(
+      contrast_name,
+      ": fewer than 3 denominator cells; skipped."
+    )
+    return(NULL)
+  }
+
+
+  ############################
+  # 9-1. FindMarkers
+  ############################
+
+deg_result <- tryCatch(
+
+  FindMarkers(
+    object = seurat_object,
+    ident.1 = numerator_groups,
+    ident.2 = denominator_groups,
+    group.by = group_column,
+    assay = "RNA",
+    slot = "data",
+    test.use = "wilcox",
+    min.pct = 0.10,
+    logfc.threshold = 0,
+    only.pos = FALSE,
+    verbose = TRUE
+  ),
+
+  error = function(e) {
+
+    message(
+      contrast_name,
+      " failed: ",
+      conditionMessage(e)
+    )
+
+    return(NULL)
+  }
+)
+
+  if (is.null(deg_result)) {
+    return(NULL)
+  }
+
+  deg_result$gene <- rownames(deg_result)
+
+  deg_result <- deg_result %>%
+    select(gene, everything()) %>%
+    mutate(
+      contrast = contrast_name,
+      category = contrast_category,
+      numerator = paste(
+        numerator_groups,
+        collapse = "+"
+      ),
+      denominator = paste(
+        denominator_groups,
+        collapse = "+"
+      ),
+      direction = case_when(
+        avg_log2FC > 0 ~ paste0(
+          paste(numerator_groups, collapse = "+"),
+          "_up"
+        ),
+        avg_log2FC < 0 ~ paste0(
+          paste(denominator_groups, collapse = "+"),
+          "_up"
+        ),
+        TRUE ~ "No_change"
+      )
+    ) %>%
+    arrange(
+      p_val_adj,
+      desc(abs(avg_log2FC))
+    )
+
+
+  ############################
+  # 9-2. Save all DEG
+  ############################
+
+  write.csv(
+    deg_result,
+    file.path(
+      contrast_dir,
+      paste0(
+        contrast_name,
+        "_all_DEG.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+
+  ############################
+  # 9-3. Strict DEG
+  ############################
+
+  deg_strict <- deg_result %>%
+    filter(
+      p_val_adj < deg_adj_p_cutoff,
+      abs(avg_log2FC) >= deg_log2fc_cutoff
+    )
+
+  numerator_up_strict <- deg_strict %>%
+    filter(avg_log2FC > 0) %>%
+    arrange(
+      p_val_adj,
+      desc(avg_log2FC)
+    )
+
+  denominator_up_strict <- deg_strict %>%
+    filter(avg_log2FC < 0) %>%
+    arrange(
+      p_val_adj,
+      avg_log2FC
+    )
+
+  write.csv(
+    deg_strict,
+    file.path(
+      contrast_dir,
+      paste0(
+        contrast_name,
+        "_significant_DEG_log2FC0.25.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    numerator_up_strict,
+    file.path(
+      contrast_dir,
+      paste0(
+        contrast_name,
+        "_numerator_up_log2FC0.25.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    denominator_up_strict,
+    file.path(
+      contrast_dir,
+      paste0(
+        contrast_name,
+        "_denominator_up_log2FC0.25.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+
+  ############################
+  # 9-4. Relaxed DEG
+  ############################
+
+  deg_relaxed <- deg_result %>%
+    filter(
+      p_val_adj < relaxed_adj_p_cutoff,
+      abs(avg_log2FC) >= relaxed_log2fc_cutoff
+    )
+
+  numerator_up_relaxed <- deg_relaxed %>%
+    filter(avg_log2FC > 0) %>%
+    arrange(
+      p_val_adj,
+      desc(avg_log2FC)
+    )
+
+  denominator_up_relaxed <- deg_relaxed %>%
+    filter(avg_log2FC < 0) %>%
+    arrange(
+      p_val_adj,
+      avg_log2FC
+    )
+
+  write.csv(
+    deg_relaxed,
+    file.path(
+      contrast_dir,
+      paste0(
+        contrast_name,
+        "_significant_DEG_log2FC0.10.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    numerator_up_relaxed,
+    file.path(
+      contrast_dir,
+      paste0(
+        contrast_name,
+        "_numerator_up_log2FC0.10.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    denominator_up_relaxed,
+    file.path(
+      contrast_dir,
+      paste0(
+        contrast_name,
+        "_denominator_up_log2FC0.10.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+
+  ############################
+  # 9-5. GSEA RNK
+  ############################
+
+  rnk_table <- create_gsea_rnk(
+    deg_table = deg_result,
+    contrast_name = contrast_name,
+    contrast_dir = contrast_dir
+  )
+
+
+  ############################
+  # 9-6. Enrichr strict
+  ############################
+
+  enrich_numerator_strict <- run_and_save_enrichr(
+    gene_list = numerator_up_strict$gene,
+    contrast_name = contrast_name,
+    direction_name = "numerator_up",
+    cutoff_name = "strict_log2FC0.25",
+    contrast_dir = contrast_dir,
+    databases = dbs
+  )
+
+  enrich_denominator_strict <- run_and_save_enrichr(
+    gene_list = denominator_up_strict$gene,
+    contrast_name = contrast_name,
+    direction_name = "denominator_up",
+    cutoff_name = "strict_log2FC0.25",
+    contrast_dir = contrast_dir,
+    databases = dbs
+  )
+
+
+  ############################
+  # 9-7. Enrichr relaxed
+  ############################
+
+  enrich_numerator_relaxed <- run_and_save_enrichr(
+    gene_list = numerator_up_relaxed$gene,
+    contrast_name = contrast_name,
+    direction_name = "numerator_up",
+    cutoff_name = "relaxed_log2FC0.10",
+    contrast_dir = contrast_dir,
+    databases = dbs
+  )
+
+  enrich_denominator_relaxed <- run_and_save_enrichr(
+    gene_list = denominator_up_relaxed$gene,
+    contrast_name = contrast_name,
+    direction_name = "denominator_up",
+    cutoff_name = "relaxed_log2FC0.10",
+    contrast_dir = contrast_dir,
+    databases = dbs
+  )
+
+
+  ############################
+  # 9-8. Contrast summary
+  ############################
+
+  contrast_summary <- data.frame(
+    contrast = contrast_name,
+    category = contrast_category,
+    numerator = paste(
+      numerator_groups,
+      collapse = "+"
+    ),
+    denominator = paste(
+      denominator_groups,
+      collapse = "+"
+    ),
+    numerator_cells = length(cells_numerator),
+    denominator_cells = length(cells_denominator),
+    tested_genes = nrow(deg_result),
+    strict_significant_genes = nrow(deg_strict),
+    strict_numerator_up = nrow(numerator_up_strict),
+    strict_denominator_up = nrow(denominator_up_strict),
+    relaxed_significant_genes = nrow(deg_relaxed),
+    relaxed_numerator_up = nrow(numerator_up_relaxed),
+    relaxed_denominator_up = nrow(denominator_up_relaxed),
+    stringsAsFactors = FALSE
+  )
+
+  write.csv(
+    contrast_summary,
+    file.path(
+      contrast_dir,
+      paste0(
+        contrast_name,
+        "_summary.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+  cat(
+    "\nCompleted: ",
+    contrast_name,
+    "\nStrict numerator-up: ",
+    nrow(numerator_up_strict),
+    "\nStrict denominator-up: ",
+    nrow(denominator_up_strict),
+    "\n",
+    sep = ""
+  )
+
+  return(
+    list(
+      summary = contrast_summary,
+      deg_all = deg_result,
+      deg_strict = deg_strict,
+      deg_relaxed = deg_relaxed,
+      gsea_rnk = rnk_table
+    )
+  )
+}
+
+
+##############################
+# 10. Run every comparison
+##############################
+
+all_results <- list()
+
+for (contrast_name in names(contrast_list)) {
+
+  all_results[[contrast_name]] <- run_one_contrast(
+    seurat_object = nk_cytotoxic,
+    contrast_name = contrast_name,
+    contrast_info = contrast_list[[contrast_name]]
+  )
+}
+
+
+##############################
+# 11. Combine all summaries
+##############################
+
+all_summaries <- bind_rows(
+  lapply(
+    all_results,
+    function(x) {
+
+      if (is.null(x)) {
+        return(NULL)
+      }
+
+      x$summary
+    }
+  )
+)
+
+write.csv(
+  all_summaries,
+  file.path(
+    output_root,
+    "NK_all_contrast_summary.csv"
+  ),
+  row.names = FALSE
+)
+
+print(all_summaries)
+
+
+##############################
+# 12. Combine all DEG results
+##############################
+
+all_deg_combined <- bind_rows(
+  lapply(
+    all_results,
+    function(x) {
+
+      if (is.null(x)) {
+        return(NULL)
+      }
+
+      x$deg_all
+    }
+  )
+)
+
+write.csv(
+  all_deg_combined,
+  file.path(
+    output_root,
+    "NK_all_contrasts_all_DEG_combined.csv"
+  ),
+  row.names = FALSE
+)
+
+
+##############################
+# 13. Combine strict DEG results
+##############################
+
+all_strict_deg_combined <- bind_rows(
+  lapply(
+    all_results,
+    function(x) {
+
+      if (is.null(x)) {
+        return(NULL)
+      }
+
+      x$deg_strict
+    }
+  )
+)
+
+write.csv(
+  all_strict_deg_combined,
+  file.path(
+    output_root,
+    "NK_all_contrasts_significant_DEG_log2FC0.25_combined.csv"
+  ),
+  row.names = FALSE
+)
+
+
+##############################
+# 14. DOCK8 across all contrasts
+##############################
+
+dock8_all_contrasts <- all_deg_combined %>%
+  filter(gene == "DOCK8") %>%
+  arrange(p_val_adj)
+
+write.csv(
+  dock8_all_contrasts,
+  file.path(
+    output_root,
+    "NK_DOCK8_all_contrasts.csv"
+  ),
+  row.names = FALSE
+)
+
+print(dock8_all_contrasts)
+
+
+##############################
+# 15. Verify output files
+##############################
+
+all_output_files <- list.files(
+  output_root,
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+file_inventory <- data.frame(
+  file = all_output_files,
+  size_bytes = file.info(all_output_files)$size,
+  modified_time = file.info(all_output_files)$mtime,
+  stringsAsFactors = FALSE
+)
+
+write.csv(
+  file_inventory,
+  file.path(
+    output_root,
+    "NK_analysis_file_inventory.csv"
+  ),
+  row.names = FALSE
+)
+
+cat(
+  "\n============================================\n",
+  "All analyses completed.\n",
+  "Output directory:\n",
+  output_root,
+  "\nNumber of generated files: ",
+  length(all_output_files),
+  "\n============================================\n",
+  sep = ""
+)
+
+print(
+  list.files(
+    output_root,
+    recursive = TRUE
+  )
+)
+
