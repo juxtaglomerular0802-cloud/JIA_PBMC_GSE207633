@@ -1,0 +1,24 @@
+library(Seurat)
+
+setwd("D:/JIA")
+data <- readRDS("GSE207633_RPCA_Azimuth_annotated_res0.6.rds")
+
+library(Seurat)
+
+# G1, G2 환자 정의
+G1 <- c(794, 1056, 673, 1087)   # 2-5세 환자
+G2 <- c(1295, 805, 704)        # 9세 이상 환자
+
+# 기존 Group을 복사하여 Group2 생성
+data$Group2 <- as.character(data$Group)
+
+# Active 그룹 내에서만 G1, G2 지정
+data$Group2[
+  data$Group == "Active" & data$Patient %in% G1
+] <- "G1"
+
+data$Group2[
+  data$Group == "Active" & data$Patient %in% G2
+] <- "G2"
+
+
