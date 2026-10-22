@@ -22,3 +22,191 @@ data$Group2[
 ] <- "G2"
 
 
+
+
+
+# composition 계산
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(writexl)
+
+# =====================================================
+# 0. 데이터 준비
+# =====================================================
+
+G1 <- c("794", "1056", "673", "1087")
+G2 <- c("1295", "805", "704")
+
+meta <- data@meta.data %>%
+  mutate(
+    Patient = as.character(Patient),
+    Group = as.character(Group),
+    cluster_celltype = as.character(cluster_celltype),
+
+    Group2 = case_when(
+      Group == "Active" & Patient %in% G1 ~ "G1",
+      Group == "Active" & Patient %in% G2 ~ "G2",
+      Group == "Active" ~ "Active_Other",
+      TRUE ~ Group
+    )
+  )
+
+# 전체 cell type 목록
+celltypes <- sort(unique(na.omit(meta$cluster_celltype)))
+
+# Cell type annotation 누락 여부 확인
+cat("Total cells:", nrow(meta), "\n")
+cat("Missing cell type:", sum(is.na(meta$cluster_celltype)), "\n")
+cat("Number of cell types:", length(celltypes), "\n")
+
+# 결과 저장 폴더
+outdir <- "CellComposition_Results"
+dir.create(outdir, showWarnings = FALSE)
+
+
+# =====================================================
+# 1. 기존 Group별 cell number & proportion
+# =====================================================
+
+count1 <- meta %>%
+  count(Group, cluster_celltype, name = "Cell_Count") %>%
+  complete(
+    Group = unique(meta$Group),
+    cluster_celltype = celltypes,
+    fill = list(Cell_Count = 0)
+  ) %>%
+  group_by(Group) %>%
+  mutate(
+    Total_Cells = sum(Cell_Count),
+    Proportion = Cell_Count / Total_Cells,
+    Percentage = Proportion * 100
+  ) %>%
+  ungroup()
+
+write_xlsx(
+  list(
+    Cell_Count = count1 %>%
+      select(Group, cluster_celltype, Cell_Count) %>%
+      pivot_wider(
+        names_from = Group,
+        values_from = Cell_Count
+      ),
+
+    Proportion = count1 %>%
+      select(Group, cluster_celltype, Percentage) %>%
+      pivot_wider(
+        names_from = Group,
+        values_from = Percentage
+      ),
+
+    Summary = count1
+  ),
+  file.path(outdir, "01_Group_CellComposition.xlsx")
+)
+
+
+# =====================================================
+# 2. Group2별 cell number & proportion
+# =====================================================
+
+count2 <- meta %>%
+  count(Group2, cluster_celltype, name = "Cell_Count") %>%
+  complete(
+    Group2 = unique(meta$Group2),
+    cluster_celltype = celltypes,
+    fill = list(Cell_Count = 0)
+  ) %>%
+  group_by(Group2) %>%
+  mutate(
+    Total_Cells = sum(Cell_Count),
+    Proportion = Cell_Count / Total_Cells,
+    Percentage = Proportion * 100
+  ) %>%
+  ungroup()
+
+write_xlsx(
+  list(
+    Cell_Count = count2 %>%
+      select(Group2, cluster_celltype, Cell_Count) %>%
+      pivot_wider(
+        names_from = Group2,
+        values_from = Cell_Count
+      ),
+
+    Proportion = count2 %>%
+      select(Group2, cluster_celltype, Percentage) %>%
+      pivot_wider(
+        names_from = Group2,
+        values_from = Percentage
+      ),
+
+    Summary = count2
+  ),
+  file.path(outdir, "02_Group2_CellComposition.xlsx")
+)
+
+
+# =====================================================
+# 3. 환자별 cell number & proportion
+# =====================================================
+
+count3 <- meta %>%
+  count(Patient, Group, Group2, cluster_celltype,
+        name = "Cell_Count") %>%
+  complete(
+    nesting(Patient, Group, Group2),
+    cluster_celltype = celltypes,
+    fill = list(Cell_Count = 0)
+  ) %>%
+  group_by(Patient) %>%
+  mutate(
+    Total_Cells = sum(Cell_Count),
+    Proportion = Cell_Count / Total_Cells,
+    Percentage = Proportion * 100
+  ) %>%
+  ungroup()
+
+write_xlsx(
+  list(
+    Cell_Count = count3 %>%
+      select(cluster_celltype, Patient, Cell_Count) %>%
+      pivot_wider(
+        names_from = Patient,
+        values_from = Cell_Count
+      ),
+
+    Proportion = count3 %>%
+      select(cluster_celltype, Patient, Percentage) %>%
+      pivot_wider(
+        names_from = Patient,
+        values_from = Percentage
+      ),
+
+    Summary = count3
+  ),
+  file.path(outdir, "03_Patient_CellComposition.xlsx")
+)
+
+
+# =====================================================
+# 4. 결과 확인
+# =====================================================
+
+cat("\nExcel files saved:\n")
+print(list.files(outdir, full.names = TRUE))
+
+# 각 그룹별 총 cell 수
+print(meta %>% count(Group))
+
+# 세분화 그룹별 총 cell 수
+print(meta %>% count(Group2))
+
+# 환자별 총 cell 수
+print(meta %>% count(Patient, Group, Group2))
+
+
+
+
+
+
