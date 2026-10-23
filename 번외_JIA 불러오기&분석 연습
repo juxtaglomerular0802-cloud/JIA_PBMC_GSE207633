@@ -1,9 +1,8 @@
 library(Seurat)
 
 setwd("D:/JIA")
-data <- readRDS("GSE207633_RPCA_Azimuth_annotated_res0.6.rds")
-
-library(Seurat)
+data <- readRDS(
+  "~/GSE207633_RPCA_Azimuth_annotated_res0.6.rds"
 
 # G1, G2 환자 정의
 G1 <- c(794, 1056, 673, 1087)   # 2-5세 환자
