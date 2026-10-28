@@ -196,3 +196,36 @@ group_summary <- result %>%
   )
 
 print(group_summary)
+
+
+
+# ============================================================
+# 11. Upload Excel to Google Cloud Storage
+# ============================================================
+
+bucket_name <- "scrna_seq"
+
+file_name <- "SOX4_Patient_Level_Expression_NewClustering.xlsx"
+
+# 파일 존재 확인
+stopifnot(file.exists(file_name))
+
+# GCS 업로드
+upload_status <- system2(
+  "gcloud",
+  args = c(
+    "storage", "cp",
+    shQuote(file_name),
+    shQuote(paste0("gs://", bucket_name, "/", file_name))
+  )
+)
+
+if (upload_status != 0) {
+  stop("GCS upload failed")
+}
+
+cat(
+  "\nUpload completed:\n",
+  paste0("gs://", bucket_name, "/", file_name),
+  "\n"
+)
