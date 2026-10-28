@@ -1,0 +1,575 @@
+
+# ============================================================
+# Four-comparison pseudobulk DEG analysis by cell type
+#
+# Group:
+#   1. Active vs LungDisease
+#
+# Group2:
+#   2. G1 vs G2
+#   3. G1 vs LungDisease
+#   4. G2 vs LungDisease
+#
+# Cell type: predicted.celltype.l2
+# ============================================================
+
+library(Seurat)
+library(dplyr)
+library(Matrix)
+library(edgeR)
+library(writexl)
+
+set.seed(1234)
+
+data <- readRDS(
+  "~/GSE207633_RPCA_Azimuth_annotated_res0.6.rds"
+
+# G1, G2 환자 정의
+G1 <- c(794, 1056, 673, 1087)   # 2-5세 환자
+G2 <- c(1295, 805, 704)        # 9세 이상 환자
+
+# 기존 Group을 복사하여 Group2 생성
+data$Group2 <- as.character(data$Group)
+
+# Active 그룹 내에서만 G1, G2 지정
+data$Group2[
+  data$Group == "Active" & data$Patient %in% G1
+] <- "G1"
+
+data$Group2[
+  data$Group == "Active" & data$Patient %in% G2
+] <- "G2"
+
+# 1. Settings
+outdir <- "Pseudobulk_DEG_Four_Comparisons"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+min_cells <- 20
+min_patients <- 3
+min_count <- 10
+fdr_cutoff <- 0.05
+logfc_cutoff <- 1
+
+comparisons <- list(
+  Active_vs_LD = list(
+    column = "Group",
+    pair = c("Active", "LungDisease")
+  ),
+  G1_vs_G2 = list(
+    column = "Group2",
+    pair = c("G1", "G2")
+  ),
+  G1_vs_LD = list(
+    column = "Group2",
+    pair = c("G1", "LungDisease")
+  ),
+  G2_vs_LD = list(
+    column = "Group2",
+    pair = c("G2", "LungDisease")
+  )
+)
+
+# 2. Check metadata and RNA counts
+stopifnot(exists("data"))
+
+stopifnot(all(
+  c(
+    "Patient",
+    "Group",
+    "Group2",
+    "predicted.celltype.l2"
+  ) %in% colnames(data@meta.data)
+))
+
+DefaultAssay(data) <- "RNA"
+
+# Seurat v5: join count layers if needed
+count_layers <- grep(
+  "^counts",
+  Layers(data[["RNA"]]),
+  value = TRUE
+)
+
+if (length(count_layers) > 1) {
+  data <- JoinLayers(data, assay = "RNA")
+}
+
+# 3. Select cells
+meta0 <- data@meta.data
+
+cells0 <- rownames(meta0)[
+  !is.na(meta0$Patient) &
+  !is.na(meta0$predicted.celltype.l2) &
+  (
+    as.character(meta0$Group) %in%
+      c("Active", "LungDisease") |
+    as.character(meta0$Group2) %in%
+      c("G1", "G2", "LungDisease")
+  )
+]
+
+data_sub <- subset(data, cells = cells0)
+DefaultAssay(data_sub) <- "RNA"
+
+celltypes <- sort(unique(
+  as.character(data_sub$predicted.celltype.l2)
+))
+
+cat("\nCell types:\n")
+print(celltypes)
+
+cat("\nGroup distribution:\n")
+print(table(data_sub$Group, useNA = "ifany"))
+
+cat("\nGroup2 distribution:\n")
+print(table(data_sub$Group2, useNA = "ifany"))
+
+# Result containers
+deg_results <- list()
+summary_results <- list()
+cell_counts_list <- list()
+failures <- list()
+
+# 4. Analyze each cell type
+for (ct in celltypes) {
+
+  cat("\n====================================\n")
+  cat("Analyzing:", ct, "\n")
+  cat("====================================\n")
+
+  # Process each comparison independently
+  for (cmp in names(comparisons)) {
+
+    tryCatch({
+
+      setting <- comparisons[[cmp]]
+      group_column <- setting$column
+      pair <- setting$pair
+
+      # Select cells of current cell type
+      # and current comparison groups
+      meta_ct <- data_sub@meta.data
+
+      cells_ct <- rownames(meta_ct)[
+        as.character(
+          meta_ct$predicted.celltype.l2
+        ) == ct &
+        !is.na(meta_ct[[group_column]]) &
+        as.character(
+          meta_ct[[group_column]]
+        ) %in% pair
+      ]
+
+      if (length(cells_ct) == 0) {
+        stop("No cells for comparison")
+      }
+
+      obj <- subset(
+        data_sub,
+        cells = cells_ct
+      )
+
+      meta <- obj@meta.data %>%
+        mutate(
+          Patient = as.character(Patient),
+          AnalysisGroup = as.character(
+            .data[[group_column]]
+          )
+        )
+
+      # Patient-level cell counts
+      cell_counts <- meta %>%
+        count(
+          Patient,
+          AnalysisGroup,
+          name = "N_Cells"
+        )
+
+      cell_counts_list[[paste(ct, cmp, sep = "__")]] <-
+        cell_counts %>%
+        mutate(
+          CellType = ct,
+          Comparison = cmp,
+          Metadata_Column = group_column,
+          .before = 1
+        )
+
+      # Check patient group consistency
+      if (any(
+        (cell_counts %>% count(Patient))$n > 1
+      )) {
+        stop("Patient appears in multiple groups")
+      }
+
+      # Minimum cells per patient
+      valid <- cell_counts %>%
+        filter(N_Cells >= min_cells) %>%
+        arrange(Patient)
+
+      n1 <- sum(valid$AnalysisGroup == pair[1])
+      n2 <- sum(valid$AnalysisGroup == pair[2])
+
+      if (
+        n1 < min_patients ||
+        n2 < min_patients
+      ) {
+        stop(
+          paste0(
+            "Insufficient patients: ",
+            n1, " vs ", n2
+          )
+        )
+      }
+
+      # Retain valid patients
+      obj <- subset(
+        obj,
+        cells = rownames(meta)[
+          meta$Patient %in% valid$Patient
+        ]
+      )
+
+      # Safe pseudobulk IDs
+      key <- valid %>%
+        mutate(
+          PbID = sprintf(
+            "P%05d",
+            seq_len(n())
+          )
+        )
+
+      obj$PbID <- key$PbID[
+        match(
+          as.character(obj$Patient),
+          key$Patient
+        )
+      ]
+
+      if (anyNA(obj$PbID)) {
+        stop("PbID mapping failed")
+      }
+
+      # 5. Aggregate raw counts by patient
+      pb <- AggregateExpression(
+        obj,
+        assays = "RNA",
+        group.by = "PbID",
+        return.seurat = FALSE,
+        verbose = FALSE
+      )$RNA
+
+      pb_meta <- key[
+        match(colnames(pb), key$PbID),
+        ,
+        drop = FALSE
+      ]
+
+      if (anyNA(pb_meta$Patient)) {
+        stop("Pseudobulk patient ID mismatch")
+      }
+
+      rownames(pb_meta) <- colnames(pb)
+
+      # 6. DEG analysis
+      md <- pb_meta
+
+      counts <- pb[
+        ,
+        md$PbID,
+        drop = FALSE
+      ]
+
+      # edgeR DGEList
+      y <- DGEList(counts = counts)
+
+      # Group factor
+      md$AnalysisGroup <- factor(
+        md$AnalysisGroup,
+        levels = pair
+      )
+
+      design <- model.matrix(
+        ~ 0 + AnalysisGroup,
+        data = md
+      )
+
+      colnames(design) <- pair
+
+      # Gene filtering
+      keep <- filterByExpr(
+        y,
+        design = design,
+        min.count = min_count
+      )
+
+      y <- y[
+        keep,
+        ,
+        keep.lib.sizes = FALSE
+      ]
+
+      if (nrow(y) < 20) {
+        stop("Insufficient expressed genes")
+      }
+
+      # TMM normalization
+      y <- calcNormFactors(
+        y,
+        method = "TMM"
+      )
+
+      # Dispersion estimation
+      y <- estimateDisp(
+        y,
+        design,
+        robust = TRUE
+      )
+
+      # Quasi-likelihood negative binomial GLM
+      fit <- glmQLFit(
+        y,
+        design,
+        robust = TRUE
+      )
+
+      # Positive logFC = higher in first group
+      # Negative logFC = higher in second group
+      contrast <- rep(0, ncol(design))
+
+      contrast[
+        match(pair[1], colnames(design))
+      ] <- 1
+
+      contrast[
+        match(pair[2], colnames(design))
+      ] <- -1
+
+      qlf <- glmQLFTest(
+        fit,
+        contrast = contrast
+      )
+
+      # All tested genes
+      deg <- topTags(
+        qlf,
+        n = Inf,
+        sort.by = "PValue"
+      )$table
+
+      deg$Gene <- rownames(deg)
+
+      # DEG classification
+      deg <- deg %>%
+        mutate(
+          CellType = ct,
+          Comparison = cmp,
+          Metadata_Column = group_column,
+          Group1 = pair[1],
+          Group2 = pair[2],
+          N_Group1 = n1,
+          N_Group2 = n2,
+          Regulation = case_when(
+            FDR < fdr_cutoff &
+              logFC >= logfc_cutoff ~ "Up",
+            FDR < fdr_cutoff &
+              logFC <= -logfc_cutoff ~ "Down",
+            TRUE ~ "NS"
+          )
+        ) %>%
+        select(
+          CellType,
+          Comparison,
+          Metadata_Column,
+          Gene,
+          Group1,
+          Group2,
+          N_Group1,
+          N_Group2,
+          logFC,
+          logCPM,
+          F,
+          PValue,
+          FDR,
+          Regulation
+        )
+
+      result_key <- paste(
+        ct,
+        cmp,
+        sep = "__"
+      )
+
+      deg_results[[result_key]] <- deg
+
+      # Summary
+      summary_results[[result_key]] <- data.frame(
+        CellType = ct,
+        Comparison = cmp,
+        Metadata_Column = group_column,
+        Group1 = pair[1],
+        Group2 = pair[2],
+        N_Group1 = n1,
+        N_Group2 = n2,
+        N_Tested_Genes = nrow(deg),
+        N_FDR05 = sum(
+          deg$FDR < fdr_cutoff
+        ),
+        N_Up = sum(
+          deg$Regulation == "Up"
+        ),
+        N_Down = sum(
+          deg$Regulation == "Down"
+        ),
+        N_DEG = sum(
+          deg$Regulation != "NS"
+        )
+      )
+
+      cat(
+        cmp,
+        "| Patients:", n1, "vs", n2,
+        "| DEG:",
+        sum(deg$Regulation != "NS"),
+        "\n"
+      )
+
+    }, error = function(e) {
+
+      failure_key <- paste(
+        ct,
+        cmp,
+        sep = "__"
+      )
+
+      failures[[failure_key]] <<- data.frame(
+        CellType = ct,
+        Comparison = cmp,
+        Reason = conditionMessage(e)
+      )
+
+      cat(
+        "Skipped:", cmp,
+        "-", conditionMessage(e),
+        "\n"
+      )
+    })
+
+    if (exists("obj")) rm(obj)
+    gc(verbose = FALSE)
+  }
+
+  cat("Completed:", ct, "\n")
+}
+
+# 7. Combine results
+if (!length(deg_results)) {
+  stop("No successful DEG comparisons")
+}
+
+all_deg <- bind_rows(deg_results)
+
+summary_df <- bind_rows(summary_results) %>%
+  arrange(
+    Comparison,
+    desc(N_DEG)
+  )
+
+significant_deg <- all_deg %>%
+  filter(Regulation != "NS") %>%
+  arrange(
+    Comparison,
+    CellType,
+    FDR
+  )
+
+failure_df <- if (length(failures)) {
+  bind_rows(failures)
+} else {
+  data.frame(
+    CellType = character(),
+    Comparison = character(),
+    Reason = character()
+  )
+}
+
+# 8. Excel export
+# Overview workbook
+
+write_xlsx(
+  list(
+    DEG_Summary = summary_df,
+    Significant_DEGs = significant_deg,
+    Patient_Cell_Counts = bind_rows(
+      cell_counts_list
+    ),
+    Skipped_Analyses = failure_df
+  ),
+  file.path(
+    outdir,
+    "DEG_Overview.xlsx"
+  )
+)
+
+# Separate workbook for each comparison
+for (cmp in names(comparisons)) {
+
+  cmp_df <- all_deg %>%
+    filter(Comparison == cmp)
+
+  if (nrow(cmp_df) == 0) {
+    cat(
+      "No results to export:",
+      cmp,
+      "\n"
+    )
+    next
+  }
+
+  # One sheet per cell type
+  sheets <- split(
+    cmp_df,
+    cmp_df$CellType
+  )
+
+  # Safe Excel sheet names
+  sheet_names <- substr(
+    gsub(
+      "[^A-Za-z0-9_]",
+      "_",
+      names(sheets)
+    ),
+    1,
+    27
+  )
+
+  names(sheets) <- make.unique(
+    sheet_names,
+    sep = "_"
+  )
+
+  # Save comparison
+  write_xlsx(
+    sheets,
+    file.path(
+      outdir,
+      paste0("DEG_", cmp, ".xlsx")
+    )
+  )
+
+  cat(
+    "Saved:",
+    paste0("DEG_", cmp, ".xlsx"),
+    "\n"
+  )
+}
+
+# 9. Print summary
+cat("\n========== DEG SUMMARY ==========\n")
+
+print(
+  as.data.frame(summary_df),
+  row.names = FALSE
+)
+
+cat("\nSaved to:\n")
+cat(normalizePath(outdir), "\n")
