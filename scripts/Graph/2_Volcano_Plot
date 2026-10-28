@@ -1,0 +1,333 @@
+# ============================================================
+# Volcano Plot
+# CD4 Naive / CD8 TEM
+# G1 vs LungDisease
+# Improved gene label separation
+# ============================================================
+
+# 1. Packages
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+# ============================================================
+# 2. Load Excel
+# ============================================================
+
+file_path <- "2_DEG_G1_vs_LD.xlsx"
+
+target_sheets <- c(
+  "CD4_Naive",
+  "CD8_TEM"
+)
+
+# Output directory
+outdir <- "Volcano_G1_vs_LD"
+
+dir.create(
+  outdir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+# ============================================================
+# 3. Generate volcano plots
+# ============================================================
+
+for (sheet_name in target_sheets) {
+
+  cat("\n====================================\n")
+  cat("Analyzing:", sheet_name, "\n")
+  cat("====================================\n")
+
+  # ----------------------------------------------------------
+  # 3-1. Read DEG data
+  # ----------------------------------------------------------
+
+  deg <- read_excel(
+    file_path,
+    sheet = sheet_name
+  )
+
+  # ----------------------------------------------------------
+  # 3-2. Prepare DEG data
+  # ----------------------------------------------------------
+
+  deg <- deg %>%
+    filter(Comparison == "G1_vs_LD") %>%
+    mutate(
+      negLogP = -log10(
+        pmax(PValue, .Machine$double.xmin)
+      ),
+      Regulation = case_when(
+        FDR < 0.05 & logFC >= 1 ~ "Up",
+        FDR < 0.05 & logFC <= -1 ~ "Down",
+        TRUE ~ "NS"
+      ),
+      Regulation = factor(
+        Regulation,
+        levels = c("NS", "Down", "Up")
+      )
+    ) %>%
+    filter(
+      is.finite(logFC),
+      is.finite(negLogP)
+    )
+
+  # ----------------------------------------------------------
+  # 3-3. DEG summary
+  # ----------------------------------------------------------
+
+  print(table(deg$Regulation))
+
+  # ----------------------------------------------------------
+  # 3-4. Select top 10 significant genes
+  # ----------------------------------------------------------
+
+  label_genes <- deg %>%
+    filter(
+      Regulation != "NS",
+      !is.na(Gene)
+    ) %>%
+    arrange(FDR, desc(abs(logFC))) %>%
+    slice_head(n = 10)
+
+  print(label_genes$Gene)
+
+  # ----------------------------------------------------------
+  # 3-5. Symmetric X-axis
+  # ----------------------------------------------------------
+
+  max_abs_fc <- max(
+    abs(deg$logFC),
+    na.rm = TRUE
+  )
+
+  x_limit <- max(
+    2,
+    ceiling(max_abs_fc * 1.15)
+  )
+
+  # ----------------------------------------------------------
+  # 3-6. Cell type title
+  # ----------------------------------------------------------
+
+  cell_title <- switch(
+    sheet_name,
+    "CD4_Naive" = "CD4 Naive T Cells",
+    "CD8_TEM" = "CD8 TEM"
+  )
+
+  # ----------------------------------------------------------
+  # 3-7. Volcano plot
+  # ----------------------------------------------------------
+
+  p <- ggplot(
+    deg,
+    aes(
+      x = logFC,
+      y = negLogP
+    )
+  ) +
+
+    # All genes
+    geom_point(
+      aes(color = Regulation),
+      size = 1.6,
+      alpha = 0.75
+    ) +
+
+    # Fold change thresholds
+    geom_vline(
+      xintercept = c(-1, 1),
+      linetype = "dashed",
+      color = "grey50",
+      linewidth = 0.4
+    ) +
+
+    # P-value threshold
+    geom_hline(
+      yintercept = -log10(0.05),
+      linetype = "dashed",
+      color = "grey50",
+      linewidth = 0.4
+    ) +
+
+    # --------------------------------------------------------
+    # Improved gene labels
+    # --------------------------------------------------------
+
+    geom_text_repel(
+      data = label_genes,
+      aes(label = Gene),
+
+      size = 3.5,
+      fontface = "plain",
+
+      # Label separation
+      box.padding = 0.8,
+      point.padding = 0.5,
+
+      # Repulsion strength
+      force = 10,
+      force_pull = 0.2,
+
+      # Avoid dropping labels
+      max.overlaps = Inf,
+
+      # More iterations for better placement
+      max.iter = 50000,
+      max.time = 10,
+
+      # Connecting lines
+      min.segment.length = 0,
+      segment.color = "grey50",
+      segment.size = 0.3,
+
+      # Reproducibility
+      seed = 1234,
+
+      # Avoid clipping
+      direction = "both"
+    ) +
+
+    # --------------------------------------------------------
+    # Colors
+    # --------------------------------------------------------
+
+    scale_color_manual(
+      values = c(
+        "NS" = "grey75",
+        "Down" = "#4C78A8",
+        "Up" = "#D95F5F"
+      ),
+      drop = FALSE
+    ) +
+
+    # --------------------------------------------------------
+    # Symmetric X-axis
+    # --------------------------------------------------------
+
+    scale_x_continuous(
+      limits = c(-x_limit, x_limit),
+      breaks = pretty(
+        c(-x_limit, x_limit),
+        n = 7
+      ),
+      expand = expansion(mult = 0.05)
+    ) +
+
+    # Additional Y-axis space for labels
+    scale_y_continuous(
+      expand = expansion(
+        mult = c(0.05, 0.20)
+      )
+    ) +
+
+    coord_cartesian(
+      clip = "off"
+    ) +
+
+    # --------------------------------------------------------
+    # Labels
+    # --------------------------------------------------------
+
+    labs(
+      title = cell_title,
+      subtitle = "G1 vs Lung Disease",
+      x = expression(
+        log[2]~"Fold Change (G1 / LD)"
+      ),
+      y = expression(
+        -log[10]~"P-value"
+      ),
+      color = "Regulation"
+    ) +
+
+    # --------------------------------------------------------
+    # Theme
+    # --------------------------------------------------------
+
+    theme_classic(
+      base_size = 13
+    ) +
+
+    theme(
+      plot.title = element_text(
+        face = "bold",
+        size = 16
+      ),
+
+      plot.subtitle = element_text(
+        size = 12
+      ),
+
+      legend.position = "top",
+
+      panel.grid = element_blank(),
+
+      plot.margin = margin(
+        t = 25,
+        r = 40,
+        b = 20,
+        l = 40
+      )
+    )
+
+  # ----------------------------------------------------------
+  # 3-8. Display
+  # ----------------------------------------------------------
+
+  print(p)
+
+  # ----------------------------------------------------------
+  # 3-9. Save PNG
+  # ----------------------------------------------------------
+
+  ggsave(
+    filename = file.path(
+      outdir,
+      paste0(
+        "Volcano_",
+        sheet_name,
+        "_G1_vs_LD.png"
+      )
+    ),
+    plot = p,
+    width = 9,
+    height = 7,
+    dpi = 300,
+    bg = "white",
+    limitsize = FALSE
+  )
+
+  # ----------------------------------------------------------
+  # 3-10. Save PDF
+  # ----------------------------------------------------------
+
+  ggsave(
+    filename = file.path(
+      outdir,
+      paste0(
+        "Volcano_",
+        sheet_name,
+        "_G1_vs_LD.pdf"
+      )
+    ),
+    plot = p,
+    width = 9,
+    height = 7,
+    limitsize = FALSE
+  )
+
+  cat("Completed:", sheet_name, "\n")
+}
+
+
+
+
+
+
+
+cat("\nAll volcano plots completed.\n")
