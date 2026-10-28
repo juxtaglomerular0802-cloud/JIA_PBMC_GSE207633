@@ -1,0 +1,230 @@
+# ============================================================
+# SOX4 Patient-Level Dot Plot
+# CD4 Naive / CD8 TEM
+# G1 / G2 / LungDisease
+# ============================================================
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+
+# ============================================================
+# 1. Load CSV
+# ============================================================
+
+file_path <- "4_SOX4.csv"
+
+df <- read_csv(
+  file_path,
+  show_col_types = FALSE
+)
+
+# ============================================================
+# 2. Prepare data
+# ============================================================
+
+df <- df %>%
+  filter(
+    CellType %in% c("CD4 Naive", "CD8 TEM"),
+    Group2 %in% c("G1", "G2", "LungDisease"),
+    !is.na(Patient)
+  ) %>%
+  mutate(
+    Patient = as.character(Patient),
+    Group2 = factor(
+      Group2,
+      levels = c("G1", "G2", "LungDisease")
+    )
+  )
+
+# Check data
+print(table(df$CellType, df$Group2))
+
+# ============================================================
+# 3. Output folder
+# ============================================================
+
+output_dir <- "SOX4_Patient_DotPlots"
+
+dir.create(
+  output_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+# ============================================================
+# 4. Colors
+# ============================================================
+
+group_colors <- c(
+  "G1" = "#D55E5E",
+  "G2" = "#E5A0A0",
+  "LungDisease" = "#3978A8"
+)
+
+# ============================================================
+# 5. Dot plot function
+# ============================================================
+
+plot_sox4 <- function(cell_type, variable, y_label) {
+
+  plot_df <- df %>%
+    filter(CellType == cell_type) %>%
+    arrange(Group2, Patient) %>%
+    mutate(
+      Patient = factor(
+        Patient,
+        levels = unique(Patient)
+      ),
+      Patient_Label = paste0(
+        Patient,
+        "\n(n=", N_Cells, ")"
+      )
+    )
+
+  patient_labels <- setNames(
+    plot_df$Patient_Label,
+    as.character(plot_df$Patient)
+  )
+
+  p <- ggplot(
+    plot_df,
+    aes(
+      x = Patient,
+      y = .data[[variable]],
+      color = Group2
+    )
+  ) +
+
+    geom_point(
+      size = 4,
+      alpha = 0.95
+    ) +
+
+    scale_color_manual(
+      values = group_colors,
+      drop = FALSE
+    ) +
+
+    scale_x_discrete(
+      labels = patient_labels,
+      expand = expansion(add = 0.5)
+    ) +
+
+    scale_y_continuous(
+      expand = expansion(mult = c(0.05, 0.12))
+    ) +
+
+    labs(
+      title = paste0("SOX4 - ", cell_type),
+      x = "Patient ID (Cell count)",
+      y = y_label,
+      color = "Group"
+    ) +
+
+    theme_classic(base_size = 14) +
+
+    theme(
+      plot.title = element_text(
+        face = "bold",
+        hjust = 0.5,
+        size = 15
+      ),
+
+      axis.text.x = element_text(
+        angle = 45,
+        hjust = 1,
+        vjust = 1,
+        size = 9,
+        color = "black"
+      ),
+
+      axis.text.y = element_text(
+        size = 11,
+        color = "black"
+      ),
+
+      axis.title = element_text(
+        size = 12
+      ),
+
+      legend.position = "top",
+
+      panel.grid.major.y = element_line(
+        color = "grey90",
+        linewidth = 0.3
+      )
+    )
+
+  print(p)
+
+  filename <- paste0(
+    gsub(" ", "_", cell_type),
+    "_",
+    variable,
+    "_DotPlot"
+  )
+
+  # Save PDF
+  ggsave(
+    file.path(
+      output_dir,
+      paste0(filename, ".pdf")
+    ),
+    plot = p,
+    width = 11,
+    height = 5.5
+  )
+
+  # Save PNG
+  ggsave(
+    file.path(
+      output_dir,
+      paste0(filename, ".png")
+    ),
+    plot = p,
+    width = 11,
+    height = 5.5,
+    dpi = 300
+  )
+
+  return(p)
+}
+
+# ============================================================
+# 6. Generate plots
+# ============================================================
+
+# CD4 Naive - Mean expression
+p1 <- plot_sox4(
+  "CD4 Naive",
+  "Mean_SOX4",
+  "Mean SOX4 Expression"
+)
+
+# CD4 Naive - Positive percentage
+p2 <- plot_sox4(
+  "CD4 Naive",
+  "Pct_SOX4_Positive",
+  "SOX4-positive Cells (%)"
+)
+
+# CD8 TEM - Mean expression
+p3 <- plot_sox4(
+  "CD8 TEM",
+  "Mean_SOX4",
+  "Mean SOX4 Expression"
+)
+
+# CD8 TEM - Positive percentage
+p4 <- plot_sox4(
+  "CD8 TEM",
+  "Pct_SOX4_Positive",
+  "SOX4-positive Cells (%)"
+)
+
+# ============================================================
+# 7. Confirm saved files
+# ============================================================
+
+list.files(output_dir)
