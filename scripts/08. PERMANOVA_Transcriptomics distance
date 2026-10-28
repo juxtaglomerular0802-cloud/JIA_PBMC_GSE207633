@@ -1,0 +1,161 @@
+library(Seurat)
+
+setwd("D:/JIA")
+data <- readRDS(
+  "~/GSE207633_RPCA_Azimuth_annotated_res0.6.rds"
+)
+
+colnames(data@meta.data)
+
+table(data$predicted.celltype.l2)
+
+
+# G1, G2 환자 정의
+G1 <- c(794, 1056, 673, 1087)   # 2-5세 환자
+G2 <- c(1295, 805, 704)        # 9세 이상 환자
+
+# 기존 Group을 복사하여 Group2 생성
+data$Group2 <- as.character(data$Group)
+
+# Active 그룹 내에서만 G1, G2 지정
+data$Group2[
+  data$Group == "Active" & data$Patient %in% G1
+] <- "G1"
+
+data$Group2[
+  data$Group == "Active" & data$Patient %in% G2
+] <- "G2"
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(Matrix)
+library(vegan)
+library(cluster)
+library(writexl)
+
+set.seed(1234)
+outdir <- 'Shared_PCA_Three_Comparisons'
+dir.create(outdir, showWarnings=FALSE, recursive=TRUE)
+dir.create(file.path(outdir,'Plots'), showWarnings=FALSE)
+min_cells <- 20
+min_patients <- 3
+n_pcs <- 10
+n_perm <- 999
+comparisons <- list(
+  All_sJIA_vs_LD = c('G1','G2','LungDisease'),
+  G1_vs_LD = c('G1','LungDisease'),
+  G1_vs_G2 = c('G1','G2')
+)
+
+stopifnot(all(c('Patient','Group2','predicted.celltype.l2') %in% colnames(data@meta.data)))
+stopifnot(all(c('G1','G2','LungDisease') %in% as.character(data$Group2)))
+DefaultAssay(data) <- 'RNA'
+# Subset cells first to avoid duplicating entire object
+meta0 <- data@meta.data
+cells0 <- rownames(meta0)[!is.na(meta0$Group2) & as.character(meta0$Group2) %in% c('G1','G2','LungDisease') & !is.na(meta0$Patient) & !is.na(meta0$predicted.celltype.l2)]
+data_sub <- subset(data, cells=cells0)
+DefaultAssay(data_sub) <- 'RNA'
+if (length(grep('^counts', Layers(data_sub[['RNA']]))) > 1) {
+  data_sub <- JoinLayers(data_sub, assay='RNA')
+}
+celltypes <- sort(unique(as.character(data_sub$predicted.celltype.l2)))
+results <- list(); counts_list <- list(); failures <- list(); coords_list <- list()
+
+for (ct in celltypes) {
+  cat('\nAnalyzing:',ct,'\n')
+  tryCatch({
+    cells_ct <- rownames(data_sub@meta.data)[as.character(data_sub$predicted.celltype.l2)==ct]
+    obj <- subset(data_sub, cells=cells_ct)
+    meta <- obj@meta.data %>% mutate(Patient=as.character(Patient), Group=as.character(Group2))
+    cell_counts <- meta %>% count(Patient,Group,name='N_Cells')
+    counts_list[[ct]] <- cell_counts %>% mutate(CellType=ct,.before=1)
+    if (any((cell_counts %>% count(Patient))$n > 1)) stop('Patient appears in multiple groups')
+    valid <- cell_counts %>% filter(N_Cells>=min_cells) %>% arrange(Patient)
+    group_n <- table(factor(valid$Group,levels=c('G1','G2','LungDisease')))
+    if (any(group_n < min_patients)) stop('Fewer than 3 patients in one group')
+    obj <- subset(obj,cells=rownames(meta)[meta$Patient %in% valid$Patient])
+    key <- valid %>% mutate(PbID=sprintf('P%05d',seq_len(n())))
+    obj$PbID <- key$PbID[match(as.character(obj$Patient),key$Patient)]
+    if (anyNA(obj$PbID)) stop('PbID mapping failed')
+    pb <- AggregateExpression(obj,assays='RNA',group.by='PbID',return.seurat=FALSE,verbose=FALSE)$RNA
+    pb_meta <- key[match(colnames(pb),key$PbID),,drop=FALSE]
+    if (anyNA(pb_meta$Patient)) stop('Pseudobulk ID mismatch')
+    keep <- Matrix::rowSums(pb>=10)>=2
+    pb <- pb[keep,,drop=FALSE]
+    if(nrow(pb)<20) stop('Insufficient expressed genes')
+    libsize <- Matrix::colSums(pb)
+    if(any(libsize==0)) stop('Zero library size')
+    logcpm <- log2(t(t(as.matrix(pb))/libsize*1e6)+1)
+    gene_var <- apply(logcpm,1,var)
+    gene_var <- gene_var[is.finite(gene_var) & gene_var>0]
+    if(length(gene_var)<2) stop('Insufficient variable genes')
+    top <- names(sort(gene_var,decreasing=TRUE))[seq_len(min(2000,length(gene_var)))]
+    expr <- logcpm[top,,drop=FALSE]
+    pca <- prcomp(t(expr),center=TRUE,scale.=TRUE)
+    # Same PCs and gene features across all three comparisons within each cell type
+    pcs_use <- min(n_pcs,ncol(pca$x),nrow(pca$x)-2)
+    if(pcs_use<2) stop('Insufficient PCA dimensions')
+    pc <- pca$x[,seq_len(pcs_use),drop=FALSE]
+    rownames(pb_meta) <- colnames(pb)
+    if(!identical(rownames(pc),rownames(pb_meta))) stop('PCA/patient order mismatch')
+    pb_meta$Patient <- as.character(pb_meta$Patient)
+    pb_meta$Group <- as.character(pb_meta$Group)
+    coords_list[[ct]] <- data.frame(CellType=ct,pb_meta[,c('Patient','Group','N_Cells')],pc,check.names=FALSE)
+
+    # One PCA plot containing every patient, with G1/G2/LD labels
+    plot_df <- data.frame(pb_meta,PC1=pc[,1],PC2=pc[,2])
+    p <- ggplot(plot_df,aes(PC1,PC2,color=Group)) +
+      geom_point(size=3) + geom_text(aes(label=Patient),vjust=-0.8,size=3,show.legend=FALSE) +
+      scale_color_manual(values=c(G1='#377EB8',G2='#4DAF4A',LungDisease='#E41A1C')) +
+      theme_classic(base_size=13) +
+      labs(title=paste0(ct,' - Shared PCA (all patients)'),
+           x=sprintf('PC1 (%.1f%%)',summary(pca)$importance[2,1]*100),
+           y=sprintf('PC2 (%.1f%%)',summary(pca)$importance[2,2]*100))
+    ggsave(file.path(outdir,'Plots',paste0(gsub('[^A-Za-z0-9]','_',ct),'_SharedPCA.png')),
+           p,width=7,height=5.5,dpi=300)
+
+    for (cmp in names(comparisons)) {
+      incl <- pb_meta$Group %in% comparisons[[cmp]]
+      pc2 <- pc[incl,,drop=FALSE]
+      md <- pb_meta[incl,,drop=FALSE]
+      grp <- if(cmp=='All_sJIA_vs_LD') ifelse(md$Group=='LungDisease','LungDisease','Active_sJIA') else md$Group
+      md$ContrastGroup <- factor(grp,levels=if(cmp=='All_sJIA_vs_LD') c('Active_sJIA','LungDisease') else comparisons[[cmp]])
+      n_by_group <- table(md$ContrastGroup)
+      if(any(n_by_group<min_patients)) stop(paste('Insufficient patients in',cmp))
+      d <- dist(pc2,method='euclidean')
+      centroids <- lapply(levels(md$ContrastGroup),function(g) colMeans(pc2[md$ContrastGroup==g,,drop=FALSE]))
+      cd <- sqrt(sum((centroids[[1]]-centroids[[2]])^2))
+      sil <- cluster::silhouette(as.integer(md$ContrastGroup),d)
+      perm <- vegan::adonis2(d ~ ContrastGroup,data=md,permutations=n_perm)
+      results[[paste(ct,cmp,sep='__')]] <- data.frame(
+        CellType=ct,Comparison=cmp,N_Group1=as.integer(n_by_group[1]),
+        N_Group2=as.integer(n_by_group[2]),N_Genes=nrow(expr),N_PCs=pcs_use,
+        PCA_Centroid_Distance=cd,Silhouette=mean(sil[,'sil_width']),
+        PERMANOVA_F=perm$F[1],PERMANOVA_R2=perm$R2[1],PERMANOVA_P=perm$`Pr(>F)`[1]
+      )
+    }
+    cat('Completed:',ct,'\n')
+  },error=function(e){
+    failures[[ct]] <<- data.frame(CellType=ct,Reason=conditionMessage(e))
+    cat('Skipped:',ct,'-',conditionMessage(e),'\n')
+  })
+  rm(obj); gc(verbose=FALSE)
+}
+if(!length(results)) stop('No successful cell types')
+result_df <- bind_rows(results) %>% group_by(Comparison) %>%
+  mutate(FDR=p.adjust(PERMANOVA_P,method='BH')) %>% ungroup() %>%
+  arrange(Comparison,desc(PERMANOVA_R2))
+wide <- result_df %>% select(CellType,Comparison,PERMANOVA_R2,Silhouette,PCA_Centroid_Distance) %>%
+  tidyr::pivot_wider(names_from=Comparison,values_from=c(PERMANOVA_R2,Silhouette,PCA_Centroid_Distance))
+write_xlsx(list(All_Results=result_df,Comparison_Wide=wide,
+                Patient_Cell_Counts=bind_rows(counts_list),
+                PCA_Coordinates=bind_rows(coords_list),
+                Skipped_CellTypes=if(length(failures)) bind_rows(failures) else data.frame(CellType=character(),Reason=character())),
+           file.path(outdir,'Shared_PCA_Three_Comparisons.xlsx'))
+print(result_df)
+cat('\nSaved to:',normalizePath(outdir),'\n')
+
+
+
+
