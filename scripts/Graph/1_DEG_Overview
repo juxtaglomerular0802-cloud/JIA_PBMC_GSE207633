@@ -1,0 +1,209 @@
+# ============================================================
+# DEG Number Overview
+# Active vs LungDisease / G1 vs LungDisease
+# Stacked bar plot: Up / Down / Total DEG
+# ============================================================
+
+# 1. Packages
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# ============================================================
+# 2. Load CSV
+# ============================================================
+
+file_path <- "1_DEG_overview.csv"
+
+deg <- read_csv(file_path, show_col_types = FALSE)
+
+# Check comparisons
+print(unique(deg$Comparison))
+
+# ============================================================
+# 3. Analysis settings
+# ============================================================
+
+comparisons <- c(
+  "Active_vs_LD",
+  "G1_vs_LD"
+)
+
+comparison_labels <- c(
+  "Active_vs_LD" = "Active sJIA vs Lung Disease",
+  "G1_vs_LD" = "G1 vs Lung Disease"
+)
+
+# Output directory
+outdir <- "DEG_Overview_Plots"
+
+dir.create(
+  outdir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+# ============================================================
+# 4. Generate plots for each comparison
+# ============================================================
+
+for (comp in comparisons) {
+
+  cat("\n====================================\n")
+  cat("Plotting:", comp, "\n")
+  cat("====================================\n")
+
+  # ----------------------------------------------------------
+  # 4-1. Filter and sort
+  # ----------------------------------------------------------
+
+  deg_sub <- deg %>%
+    filter(Comparison == comp) %>%
+    select(
+      CellType,
+      Comparison,
+      N_Up,
+      N_Down,
+      N_DEG
+    ) %>%
+    arrange(desc(N_DEG))
+
+  print(deg_sub)
+
+  # ----------------------------------------------------------
+  # 4-2. Prepare stacked bar data
+  # ----------------------------------------------------------
+
+  plot_df <- deg_sub %>%
+    select(CellType, N_Up, N_Down) %>%
+    pivot_longer(
+      cols = c(N_Up, N_Down),
+      names_to = "Regulation",
+      values_to = "Count"
+    ) %>%
+    mutate(
+      Regulation = recode(
+        Regulation,
+        N_Up = "Up",
+        N_Down = "Down"
+      ),
+      Regulation = factor(
+        Regulation,
+        levels = c("Down", "Up")
+      ),
+      CellType = factor(
+        CellType,
+        levels = rev(deg_sub$CellType)
+      )
+    )
+
+  deg_sub <- deg_sub %>%
+    mutate(
+      CellType = factor(
+        CellType,
+        levels = rev(as.character(CellType))
+      )
+    )
+
+  # ----------------------------------------------------------
+  # 4-3. Plot
+  # ----------------------------------------------------------
+
+  p <- ggplot(
+    plot_df,
+    aes(
+      x = CellType,
+      y = Count,
+      fill = Regulation
+    )
+  ) +
+    geom_col(
+      width = 0.7
+    ) +
+    geom_text(
+      data = deg_sub,
+      aes(
+        x = CellType,
+        y = N_Up + N_Down,
+        label = N_DEG
+      ),
+      inherit.aes = FALSE,
+      hjust = -0.25,
+      size = 3.5
+    ) +
+    scale_fill_manual(
+      values = c(
+        "Up" = "#D95F5F",
+        "Down" = "#4C78A8"
+      )
+    ) +
+    coord_flip() +
+    scale_y_continuous(
+      expand = expansion(
+        mult = c(0, 0.15)
+      )
+    ) +
+    labs(
+      title = "Differentially Expressed Genes by Cell Type",
+      subtitle = comparison_labels[[comp]],
+      x = NULL,
+      y = "Number of DEGs",
+      fill = "Regulation"
+    ) +
+    theme_classic(base_size = 13) +
+    theme(
+      plot.title = element_text(
+        face = "bold",
+        size = 15
+      ),
+      axis.text.y = element_text(
+        size = 11
+      ),
+      legend.position = "top",
+      panel.grid.major.x = element_line(
+        color = "grey90",
+        linewidth = 0.3
+      )
+    )
+
+  # ----------------------------------------------------------
+  # 4-4. Display
+  # ----------------------------------------------------------
+
+  print(p)
+
+  # ----------------------------------------------------------
+  # 4-5. Save PNG
+  # ----------------------------------------------------------
+
+  ggsave(
+    filename = file.path(
+      outdir,
+      paste0("DEG_Overview_", comp, ".png")
+    ),
+    plot = p,
+    width = 9,
+    height = 7,
+    dpi = 300,
+    bg = "white"
+  )
+
+  # ----------------------------------------------------------
+  # 4-6. Save PDF
+  # ----------------------------------------------------------
+
+  ggsave(
+    filename = file.path(
+      outdir,
+      paste0("DEG_Overview_", comp, ".pdf")
+    ),
+    plot = p,
+    width = 9,
+    height = 7
+  )
+
+  cat("Saved:", comp, "\n")
+}
+
+cat("\nAll DEG overview plots completed.\n")
