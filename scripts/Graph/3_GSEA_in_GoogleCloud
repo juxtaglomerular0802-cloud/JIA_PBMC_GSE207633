@@ -1,0 +1,95 @@
+# ============================================================
+# Hallmark GSEA colored plots: Active vs LD and G1 vs LD
+# Read existing Excel results; no DEG/GSEA recomputation
+# ============================================================
+library(ggplot2)
+library(dplyr)
+library(readxl)
+
+bucket <- 'gs://scrna_seq'
+cell_types <- c('CD4 Naive', 'CD8 TEM')
+
+comparisons <- list(
+  list(label='Active', subtitle='Active vs LungDisease',
+       input='Active_LD_GSEA_CD8TEM_CD4Naive/Hallmark_GSEA_Active_vs_LD_CD8TEM_CD4Naive.xlsx',
+       output='Active_LD_GSEA_Colored'),
+  list(label='G1', subtitle='G1 vs LungDisease',
+       input='G1_LD_GSEA_CD8TEM_CD4Naive/Hallmark_GSEA_G1_vs_LD_CD8TEM_CD4Naive.xlsx',
+       output='G1_LD_GSEA_Colored')
+)
+
+# Retrieve the expected file from the bucket only when absent locally.
+get_excel <- function(path) {
+  if (file.exists(path)) return(path)
+  dir.create(dirname(path), recursive=TRUE, showWarnings=FALSE)
+  remote <- paste0(bucket, '/', path)
+  message('Downloading: ', remote)
+  status <- system2('gsutil', args=c('cp', shQuote(remote), shQuote(path)))
+  if (status != 0L || !file.exists(path)) stop('Cannot find input: ', path,
+    '\nCheck the actual Excel filename in GCS and update comparisons$input.')
+  path
+}
+
+plot_one <- function(df, ct, cmp) {
+  needed <- c('pathway','NES','padj')
+  if (!all(needed %in% names(df))) stop('Missing columns: ', paste(setdiff(needed,names(df)),collapse=', '))
+  plot_data <- df %>%
+    mutate(NES=as.numeric(NES), padj=as.numeric(padj)) %>%
+    filter(!is.na(NES), !is.na(padj)) %>%
+    arrange(padj) %>%
+    slice_head(n=20) %>%
+    mutate(
+      Pathway=gsub('_',' ',sub('^HALLMARK_','',pathway)),
+      Category=case_when(
+        NES > 0 & padj < 0.05 ~ paste0(cmp$label,' (FDR < 0.05)'),
+        NES > 0 ~ paste0(cmp$label,' (NS)'),
+        NES < 0 & padj < 0.05 ~ 'LungDisease (FDR < 0.05)',
+        TRUE ~ 'LungDisease (NS)'),
+      Pathway=factor(Pathway, levels=rev(unique(Pathway)))
+    )
+  if (nrow(plot_data)==0) stop('No usable GSEA results for ',ct)
+  palette <- c('#B2182B','#F4A6A6','#2166AC','#A6C8E5')
+  names(palette) <- c(paste0(cmp$label,' (FDR < 0.05)'),
+                      paste0(cmp$label,' (NS)'),
+                      'LungDisease (FDR < 0.05)', 'LungDisease (NS)')
+  ggplot(plot_data, aes(x=NES,y=Pathway,fill=Category)) +
+    geom_col(width=.75) +
+    geom_vline(xintercept=0,color='grey40',linewidth=.5) +
+    scale_fill_manual(values=palette, breaks=names(palette),drop=FALSE) +
+    labs(title=paste0(ct,' — Hallmark GSEA'), subtitle=cmp$subtitle,
+         x='Normalized Enrichment Score (NES)',y=NULL,fill=NULL) +
+    theme_classic(base_size=12) +
+    theme(plot.title=element_text(face='bold',size=16),
+          plot.subtitle=element_text(size=11,color='grey40'),
+          axis.text.y=element_text(size=10),axis.text.x=element_text(size=10),
+          legend.position='bottom',legend.text=element_text(size=9),
+          panel.grid.major.x=element_line(color='grey90',linewidth=.3),
+          plot.margin=margin(15,20,15,15))
+}
+
+if (Sys.which('gsutil')=='') stop('gsutil not available in PATH')
+for (cmp in comparisons) {
+  cat('\n=== ',cmp$subtitle,' ===\n',sep='')
+  input <- tryCatch(get_excel(cmp$input),error=function(e){message(conditionMessage(e));NULL})
+  if (is.null(input)) next
+  dir.create(cmp$output,recursive=TRUE,showWarnings=FALSE)
+  sheets <- excel_sheets(input)
+  for (ct in cell_types) {
+    sheet <- gsub(' ','_',ct)
+    if (!sheet %in% sheets) {warning('Missing sheet: ',sheet,' in ',input);next}
+    tryCatch({
+      df <- read_excel(input,sheet=sheet)
+      p <- plot_one(df,ct,cmp)
+      stem <- file.path(cmp$output,paste0(sheet,'_Hallmark_GSEA_Colored'))
+      ggsave(paste0(stem,'.pdf'),plot=p,width=10,height=7)
+      ggsave(paste0(stem,'.png'),plot=p,width=10,height=7,dpi=300,bg='white')
+      print(p)
+      for (f in paste0(stem,c('.pdf','.png'))) {
+        destination <- paste0(bucket,'/',cmp$output,'/',basename(f))
+        status <- system2('gsutil',args=c('cp',shQuote(f),shQuote(destination)))
+        if (status!=0L) warning('Upload failed: ',f) else message('Uploaded: ',destination)
+      }
+    },error=function(e) warning('Failed ',cmp$subtitle,' / ',ct,': ',conditionMessage(e)))
+  }
+}
+cat('\nGraph export and upload finished.\n')
