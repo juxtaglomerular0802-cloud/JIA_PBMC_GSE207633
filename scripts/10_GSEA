@@ -1,0 +1,797 @@
+
+# ============================================================
+# G1 vs LungDisease
+# CD8 TEM / CD4 Naive
+# Annotation: predicted.celltype.l2
+# Pseudobulk DEG (edgeR) + Hallmark GSEA
+# Google Cloud Storage Upload
+# ============================================================
+
+library(Seurat)
+library(dplyr)
+library(tibble)
+library(edgeR)
+library(msigdbr)
+library(fgsea)
+library(ggplot2)
+library(openxlsx)
+
+set.seed(1234)
+
+# ============================================================
+# 0. Load / validate Seurat object
+# ============================================================
+
+if (!exists("data", envir = .GlobalEnv) ||
+    !inherits(get("data", envir = .GlobalEnv), "Seurat")) {
+  stop(
+    "'data' is not a Seurat object. ",
+    "Load your RDS file into data first."
+  )
+}
+
+required_cols <- c(
+  "Patient",
+  "Group",
+  "predicted.celltype.l2"
+)
+
+stopifnot(
+  all(required_cols %in% colnames(data@meta.data))
+)
+
+DefaultAssay(data) <- "RNA"
+
+# ============================================================
+# 1. Define groups
+# ============================================================
+
+G1 <- c("794", "1056", "673", "1087")
+G2 <- c("1295", "805", "704")
+
+data$Group2 <- as.character(data$Group)
+
+data$Group2[
+  data$Group == "Active" &
+    as.character(data$Patient) %in% G1
+] <- "G1"
+
+data$Group2[
+  data$Group == "Active" &
+    as.character(data$Patient) %in% G2
+] <- "G2"
+
+# ============================================================
+# 2. Analysis settings
+# ============================================================
+
+target_cells <- c(
+  "CD8 TEM",
+  "CD4 Naive"
+)
+
+target_groups <- c(
+  "G1",
+  "LungDisease"
+)
+
+outdir <- "G1_LD_GSEA_CD8TEM_CD4Naive"
+
+dir.create(
+  outdir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+min_cells_per_patient <- 20
+min_patients_per_group <- 2
+
+# Verify cell types
+available_cells <- unique(
+  as.character(data$predicted.celltype.l2)
+)
+
+missing_cells <- setdiff(
+  target_cells,
+  available_cells
+)
+
+if (length(missing_cells) > 0) {
+  stop(
+    "Cell types not found: ",
+    paste(missing_cells, collapse = ", "),
+    "\nAvailable types: ",
+    paste(available_cells, collapse = ", ")
+  )
+}
+
+# ============================================================
+# 3. Hallmark gene sets
+# ============================================================
+
+hallmark <- msigdbr(
+  species = "Homo sapiens",
+  collection = "H"
+)
+
+pathways <- split(
+  hallmark$gene_symbol,
+  hallmark$gs_name
+)
+
+# ============================================================
+# 4. Result containers
+# ============================================================
+
+deg_results <- list()
+gsea_results <- list()
+sample_results <- list()
+analysis_log <- list()
+
+# ============================================================
+# 5. Analysis function
+# ============================================================
+
+analyze_celltype <- function(ct) {
+
+  cat("\n====================================\n")
+  cat("Analyzing:", ct, "\n")
+  cat("====================================\n")
+
+  # ----------------------------------------------------------
+  # A. Subset by metadata
+  # ----------------------------------------------------------
+
+  md <- data@meta.data
+
+  selected_cells <- rownames(md)[
+    md$Group2 %in% target_groups &
+      !is.na(md$predicted.celltype.l2) &
+      md$predicted.celltype.l2 == ct
+  ]
+
+  if (length(selected_cells) == 0) {
+    stop("No cells found for: ", ct)
+  }
+
+  sub <- subset(
+    data,
+    cells = selected_cells
+  )
+
+  sub$Patient <- as.character(sub$Patient)
+  sub$Group2 <- as.character(sub$Group2)
+
+  # ----------------------------------------------------------
+  # B. Patient-level metadata
+  # ----------------------------------------------------------
+
+  meta <- sub@meta.data %>%
+    mutate(
+      Patient = as.character(Patient),
+      Group2 = as.character(Group2)
+    ) %>%
+    group_by(Patient) %>%
+    summarise(
+      Group2 = first(Group2),
+      N_Cells = n(),
+      .groups = "drop"
+    )
+
+  # Check group consistency
+  group_check <- sub@meta.data %>%
+    group_by(Patient) %>%
+    summarise(
+      n_groups = n_distinct(Group2),
+      .groups = "drop"
+    )
+
+  if (any(group_check$n_groups != 1)) {
+    stop("Some patients belong to multiple groups.")
+  }
+
+  # Exclude patients with insufficient cells
+  meta <- meta %>%
+    filter(N_Cells >= min_cells_per_patient)
+
+  if (nrow(meta) == 0) {
+    stop("No patients passed minimum cell threshold.")
+  }
+
+  sub <- subset(
+    sub,
+    cells = colnames(sub)[
+      as.character(sub$Patient) %in% meta$Patient
+    ]
+  )
+
+  # ----------------------------------------------------------
+  # C. Pseudobulk aggregation
+  # ----------------------------------------------------------
+
+  pb <- AggregateExpression(
+    sub,
+    assays = "RNA",
+    group.by = "Patient",
+    return.seurat = FALSE,
+    verbose = FALSE
+  )$RNA
+
+  # Seurat may prefix numeric patient IDs with "g"
+  colnames(pb) <- sub(
+    "^g(?=[0-9])",
+    "",
+    colnames(pb),
+    perl = TRUE
+  )
+
+  if (anyDuplicated(colnames(pb))) {
+    stop("Duplicated pseudobulk patient IDs.")
+  }
+
+  if (!setequal(colnames(pb), meta$Patient)) {
+    stop(
+      "Pseudobulk SampleID mismatch.\n",
+      "Pseudobulk: ",
+      paste(colnames(pb), collapse = ", "),
+      "\nMetadata: ",
+      paste(meta$Patient, collapse = ", ")
+    )
+  }
+
+  meta <- meta[
+    match(colnames(pb), meta$Patient),
+    ,
+    drop = FALSE
+  ]
+
+  stopifnot(
+    identical(
+      colnames(pb),
+      as.character(meta$Patient)
+    )
+  )
+
+  meta$Group2 <- factor(
+    meta$Group2,
+    levels = c("LungDisease", "G1")
+  )
+
+  cat("\nPatient counts:\n")
+  print(table(meta$Group2))
+
+  cat("\nCell counts:\n")
+  print(meta)
+
+  group_n <- table(meta$Group2)
+
+  if (any(group_n < min_patients_per_group)) {
+    stop(
+      "Insufficient patients in one or both groups."
+    )
+  }
+
+  # ----------------------------------------------------------
+  # D. edgeR DEG
+  # ----------------------------------------------------------
+
+  y <- DGEList(
+    counts = pb,
+    group = meta$Group2
+  )
+
+  keep <- filterByExpr(
+    y,
+    group = meta$Group2
+  )
+
+  y <- y[
+    keep,
+    ,
+    keep.lib.sizes = FALSE
+  ]
+
+  if (nrow(y) < 100) {
+    stop("Too few genes after expression filtering.")
+  }
+
+  y <- calcNormFactors(y)
+
+  design <- model.matrix(
+    ~ Group2,
+    data = meta
+  )
+
+  y <- estimateDisp(
+    y,
+    design
+  )
+
+  fit <- glmQLFit(
+    y,
+    design,
+    robust = TRUE
+  )
+
+  qlf <- glmQLFTest(
+    fit,
+    coef = "Group2G1"
+  )
+
+  deg <- topTags(
+    qlf,
+    n = Inf,
+    sort.by = "none"
+  )$table
+
+  deg <- deg %>%
+    rownames_to_column("Gene") %>%
+    mutate(
+      CellType = ct,
+      Comparison = "G1_vs_LungDisease",
+      Regulation = case_when(
+        FDR < 0.05 & logFC > 0 ~ "Up_in_G1",
+        FDR < 0.05 & logFC < 0 ~ "Up_in_LD",
+        TRUE ~ "NS"
+      )
+    ) %>%
+    arrange(PValue)
+
+  cat(
+    "\nSignificant DEGs:",
+    sum(deg$FDR < 0.05, na.rm = TRUE),
+    "\n"
+  )
+
+  # ----------------------------------------------------------
+  # E. Prepare GSEA ranks
+  # ----------------------------------------------------------
+
+  ranks <- deg %>%
+    filter(
+      !is.na(F),
+      !is.na(logFC),
+      !is.na(Gene)
+    ) %>%
+    mutate(
+      Rank = sign(logFC) * sqrt(pmax(F, 0))
+    ) %>%
+    arrange(desc(abs(Rank))) %>%
+    distinct(Gene, .keep_all = TRUE)
+
+  gene_ranks <- ranks$Rank
+
+  names(gene_ranks) <- ranks$Gene
+
+  gene_ranks <- sort(
+    gene_ranks,
+    decreasing = TRUE
+  )
+
+  # ----------------------------------------------------------
+  # F. Hallmark GSEA
+  # ----------------------------------------------------------
+
+  set.seed(123)
+
+  gsea <- fgseaMultilevel(
+    pathways = pathways,
+    stats = gene_ranks,
+    minSize = 10,
+    maxSize = 500,
+    eps = 0
+  )
+
+  gsea <- as.data.frame(gsea) %>%
+    mutate(
+      CellType = ct,
+      Comparison = "G1_vs_LungDisease",
+      Direction = case_when(
+        NES > 0 ~ "Enriched_in_G1",
+        NES < 0 ~ "Enriched_in_LD",
+        TRUE ~ "Neutral"
+      ),
+      leadingEdge = vapply(
+        leadingEdge,
+        paste,
+        collapse = ", ",
+        FUN.VALUE = character(1)
+      )
+    ) %>%
+    arrange(padj)
+
+  cat(
+    "Significant pathways:",
+    sum(gsea$padj < 0.05, na.rm = TRUE),
+    "\n"
+  )
+
+  # ----------------------------------------------------------
+  # G. GSEA plot
+  # ----------------------------------------------------------
+
+  plot_data <- gsea %>%
+    filter(!is.na(NES)) %>%
+    arrange(padj) %>%
+    slice_head(n = 20) %>%
+    mutate(
+      pathway = gsub(
+        "HALLMARK_",
+        "",
+        pathway
+      ),
+      pathway = factor(
+        pathway,
+        levels = rev(unique(pathway))
+      ),
+      Significant = ifelse(
+        !is.na(padj) & padj < 0.05,
+        "FDR < 0.05",
+        "NS"
+      )
+    )
+
+  p <- ggplot(
+    plot_data,
+    aes(
+      x = NES,
+      y = pathway,
+      fill = Significant
+    )
+  ) +
+    geom_col() +
+    geom_vline(
+      xintercept = 0,
+      linetype = "dashed"
+    ) +
+    scale_fill_manual(
+      values = c(
+        "FDR < 0.05" = "#D55E00",
+        "NS" = "grey70"
+      )
+    ) +
+    labs(
+      title = paste(
+        ct,
+        "Hallmark GSEA"
+      ),
+      subtitle = paste(
+        "Positive NES: G1 |",
+        "Negative NES: LungDisease"
+      ),
+      x = "Normalized Enrichment Score (NES)",
+      y = NULL
+    ) +
+    theme_bw(base_size = 12)
+
+  filename <- gsub(
+    " ",
+    "_",
+    ct
+  )
+
+  ggsave(
+    filename = file.path(
+      outdir,
+      paste0(
+        filename,
+        "_Hallmark_GSEA.pdf"
+      )
+    ),
+    plot = p,
+    width = 9,
+    height = 7
+  )
+
+  # ----------------------------------------------------------
+  # H. Return results
+  # ----------------------------------------------------------
+
+  list(
+    DEG = deg,
+    GSEA = gsea,
+    Samples = meta
+  )
+}
+
+# ============================================================
+# 6. Run both cell types
+# ============================================================
+
+for (ct in target_cells) {
+
+  result <- tryCatch(
+    analyze_celltype(ct),
+    error = function(e) {
+      cat(
+        "\nERROR in",
+        ct,
+        ":",
+        conditionMessage(e),
+        "\n"
+      )
+      return(e)
+    }
+  )
+
+  if (inherits(result, "error")) {
+
+    analysis_log[[ct]] <- data.frame(
+      CellType = ct,
+      Status = "Failed",
+      Message = conditionMessage(result)
+    )
+
+    next
+  }
+
+  deg_results[[ct]] <- result$DEG
+  gsea_results[[ct]] <- result$GSEA
+  sample_results[[ct]] <- result$Samples
+
+  analysis_log[[ct]] <- data.frame(
+    CellType = ct,
+    Status = "Completed",
+    Message = "Success"
+  )
+
+  cat("\nCompleted:", ct, "\n")
+}
+
+# ============================================================
+# 7. Save DEG Excel
+# ============================================================
+
+if (length(deg_results) > 0) {
+
+  wb_deg <- createWorkbook()
+
+  for (ct in names(deg_results)) {
+
+    sheet <- gsub(" ", "_", ct)
+
+    addWorksheet(
+      wb_deg,
+      sheet
+    )
+
+    writeData(
+      wb_deg,
+      sheet,
+      deg_results[[ct]]
+    )
+
+    freezePane(
+      wb_deg,
+      sheet,
+      firstRow = TRUE
+    )
+
+    addFilter(
+      wb_deg,
+      sheet,
+      row = 1,
+      cols = seq_len(
+        ncol(deg_results[[ct]])
+      )
+    )
+  }
+
+  saveWorkbook(
+    wb_deg,
+    file.path(
+      outdir,
+      "DEG_G1_vs_LD_CD8TEM_CD4Naive.xlsx"
+    ),
+    overwrite = TRUE
+  )
+}
+
+# ============================================================
+# 8. Save Hallmark GSEA Excel
+# ============================================================
+
+if (length(gsea_results) > 0) {
+
+  wb_gsea <- createWorkbook()
+
+  for (ct in names(gsea_results)) {
+
+    sheet <- gsub(" ", "_", ct)
+
+    addWorksheet(
+      wb_gsea,
+      sheet
+    )
+
+    writeData(
+      wb_gsea,
+      sheet,
+      gsea_results[[ct]]
+    )
+
+    freezePane(
+      wb_gsea,
+      sheet,
+      firstRow = TRUE
+    )
+
+    addFilter(
+      wb_gsea,
+      sheet,
+      row = 1,
+      cols = seq_len(
+        ncol(gsea_results[[ct]])
+      )
+    )
+  }
+
+  saveWorkbook(
+    wb_gsea,
+    file.path(
+      outdir,
+      "Hallmark_GSEA_G1_vs_LD_CD8TEM_CD4Naive.xlsx"
+    ),
+    overwrite = TRUE
+  )
+}
+
+# ============================================================
+# 9. Save patient information
+# ============================================================
+
+if (length(sample_results) > 0) {
+
+  wb_samples <- createWorkbook()
+
+  for (ct in names(sample_results)) {
+
+    sheet <- gsub(" ", "_", ct)
+
+    addWorksheet(
+      wb_samples,
+      sheet
+    )
+
+    writeData(
+      wb_samples,
+      sheet,
+      sample_results[[ct]]
+    )
+  }
+
+  saveWorkbook(
+    wb_samples,
+    file.path(
+      outdir,
+      "Sample_Information.xlsx"
+    ),
+    overwrite = TRUE
+  )
+}
+
+# ============================================================
+# 10. Save analysis log
+# ============================================================
+
+log_df <- dplyr::bind_rows(
+  analysis_log
+)
+
+write.xlsx(
+  log_df,
+  file.path(
+    outdir,
+    "Analysis_Log.xlsx"
+  ),
+  overwrite = TRUE
+)
+
+# ============================================================
+# 11. List generated files
+# ============================================================
+
+cat("\n====================================\n")
+cat("Generated files:\n")
+cat("====================================\n")
+
+print(
+  list.files(
+    outdir,
+    recursive = TRUE,
+    full.names = TRUE
+  )
+)
+
+cat("\nAnalysis status:\n")
+print(log_df)
+
+# ============================================================
+# 12. Upload to Google Cloud Storage
+# ============================================================
+
+bucket <- "gs://scrna_seq"
+
+gcs_destination <- paste0(
+  bucket,
+  "/",
+  outdir,
+  "/"
+)
+
+# Upload only files generated in this run's folder
+generated_files <- list.files(
+  outdir,
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+if (length(generated_files) == 0) {
+  stop("No files available for upload.")
+}
+
+# gsutil availability check
+if (Sys.which("gsutil") == "") {
+  stop(
+    "gsutil is not installed or not in PATH. ",
+    "Results are saved locally."
+  )
+}
+
+cat("\nUploading to:\n")
+cat(gcs_destination, "\n")
+
+# Copy each file preserving its relative path
+upload_status <- integer(length(generated_files))
+
+for (i in seq_along(generated_files)) {
+
+  f <- generated_files[i]
+
+  relative_path <- substring(
+    f,
+    nchar(outdir) + 2
+  )
+
+  destination <- paste0(
+    gcs_destination,
+    relative_path
+  )
+
+  cmd <- paste(
+    "gsutil cp",
+    shQuote(f),
+    shQuote(destination)
+  )
+
+  upload_status[i] <- system(cmd)
+}
+
+if (all(upload_status == 0)) {
+
+  cat("\nAll files uploaded successfully.\n")
+
+} else {
+
+  warning(
+    "Some files failed to upload. ",
+    "Check permissions and gsutil output."
+  )
+}
+
+# ============================================================
+# 13. Verify bucket contents
+# ============================================================
+
+cat("\n====================================\n")
+cat("GCS bucket verification\n")
+cat("====================================\n")
+
+verify_cmd <- paste(
+  "gsutil ls",
+  shQuote(paste0(gcs_destination, "**"))
+)
+
+system(verify_cmd)
+
+cat("\nAnalysis pipeline finished.\n")
