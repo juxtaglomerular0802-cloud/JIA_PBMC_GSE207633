@@ -159,3 +159,30 @@ cat('\nSaved to:',normalizePath(outdir),'\n')
 
 
 
+
+
+# 버킷 이름만 실제 이름으로 변경
+bucket <- "scrna_seq"
+
+# 업로드할 로컬 폴더
+local_dir <- normalizePath("Shared_PCA_Three_Comparisons")
+
+# GCS 목적지
+gcs_path <- paste0(
+  "gs://", bucket,
+  "/scrna_seq/Shared_PCA_Three_Comparisons/"
+)
+
+# 폴더 전체 업로드
+cmd <- sprintf(
+  "gcloud storage cp --recursive %s %s",
+  shQuote(file.path(local_dir, "*")),
+  shQuote(gcs_path)
+)
+
+status <- system(cmd)
+
+if (status != 0) {
+  stop("GCS upload failed")
+}
+
