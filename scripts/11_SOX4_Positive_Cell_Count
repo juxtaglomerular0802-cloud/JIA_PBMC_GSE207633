@@ -1,0 +1,198 @@
+# ============================================================
+# SOX4 Patient-Level Expression
+# New clustering: predicted.celltype.l2
+# CD4 Naive / CD8 TEM
+# ============================================================
+
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+
+# ============================================================
+# 1. Analysis settings
+# ============================================================
+
+target_cells <- c("CD4 Naive", "CD8 TEM")
+target_gene <- "SOX4"
+
+out_file <- "SOX4_Patient_Level_Expression_NewClustering.xlsx"
+
+# ============================================================
+# 2. RNA assay 확인
+# ============================================================
+
+stopifnot(inherits(data, "Seurat"))
+
+stopifnot(all(
+  c("Patient", "Group2", "predicted.celltype.l2") %in%
+    colnames(data@meta.data)
+))
+
+DefaultAssay(data) <- "RNA"
+
+if (!target_gene %in% rownames(data[["RNA"]])) {
+  stop("SOX4 gene not found in RNA assay")
+}
+
+# Seurat v5: Join layers if needed
+data_layers <- grep(
+  "^data(\\.|$)",
+  Layers(data[["RNA"]]),
+  value = TRUE
+)
+
+if (length(data_layers) > 1) {
+  data <- JoinLayers(data, assay = "RNA")
+}
+
+# ============================================================
+# 3. Target cell types 추출
+# ============================================================
+
+cells_use <- rownames(data@meta.data)[
+  !is.na(data@meta.data$predicted.celltype.l2) &
+  data@meta.data$predicted.celltype.l2 %in% target_cells
+]
+
+if (length(cells_use) == 0) {
+  stop("No target cells found")
+}
+
+data_sub <- subset(
+  data,
+  cells = cells_use
+)
+
+# ============================================================
+# 4. SOX4 normalized expression 추출
+# ============================================================
+
+expr <- FetchData(
+  data_sub,
+  vars = target_gene,
+  layer = "data"
+)
+
+# ============================================================
+# 5. Metadata 결합
+# ============================================================
+
+df <- data_sub@meta.data %>%
+  select(
+    Patient,
+    Group2,
+    predicted.celltype.l2
+  ) %>%
+  mutate(
+    SOX4 = expr[rownames(.), target_gene],
+    Patient = as.character(Patient),
+    Group2 = as.character(Group2),
+    CellType = predicted.celltype.l2
+  ) %>%
+  select(
+    Group2,
+    Patient,
+    CellType,
+    SOX4
+  )
+
+# ============================================================
+# 6. Patient-level SOX4 expression
+# ============================================================
+
+result <- df %>%
+  group_by(Group2, Patient, CellType) %>%
+  summarise(
+    N_Cells = n(),
+    N_SOX4_Positive = sum(SOX4 > 0, na.rm = TRUE),
+    N_SOX4_Negative = sum(SOX4 == 0, na.rm = TRUE),
+
+    Pct_SOX4_Positive = mean(SOX4 > 0, na.rm = TRUE) * 100,
+
+    Mean_SOX4 = mean(SOX4, na.rm = TRUE),
+    Median_SOX4 = median(SOX4, na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  arrange(
+    CellType,
+    Group2,
+    Patient
+  )
+
+# ============================================================
+# 7. Excel 저장
+# ============================================================
+
+wb <- createWorkbook()
+
+# All patients
+addWorksheet(wb, "All_Patients")
+writeData(wb, "All_Patients", result)
+
+# Separate cell type sheets
+for (ct in target_cells) {
+
+  sheet_name <- gsub(" ", "_", ct)
+
+  addWorksheet(wb, sheet_name)
+
+  writeData(
+    wb,
+    sheet_name,
+    result %>%
+      filter(CellType == ct)
+  )
+}
+
+# ============================================================
+# 8. Formatting
+# ============================================================
+
+for (sheet in names(wb)) {
+
+  addFilter(
+    wb,
+    sheet,
+    row = 1,
+    cols = 1:ncol(result)
+  )
+
+  setColWidths(
+    wb,
+    sheet,
+    cols = 1:ncol(result),
+    widths = "auto"
+  )
+}
+
+# ============================================================
+# 9. Save
+# ============================================================
+
+saveWorkbook(
+  wb,
+  out_file,
+  overwrite = TRUE
+)
+
+cat("\nSaved:", out_file, "\n")
+
+print(result)
+
+# ============================================================
+# 10. Group별 요약 (참고용)
+# ============================================================
+
+group_summary <- result %>%
+  group_by(CellType, Group2) %>%
+  summarise(
+    N_Patients = n(),
+    Mean_Positive_Pct = mean(Pct_SOX4_Positive),
+    SD_Positive_Pct = sd(Pct_SOX4_Positive),
+    Median_Positive_Pct = median(Pct_SOX4_Positive),
+    .groups = "drop"
+  )
+
+print(group_summary)
