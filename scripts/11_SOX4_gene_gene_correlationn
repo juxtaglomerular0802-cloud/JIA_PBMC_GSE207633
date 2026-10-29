@@ -1,0 +1,325 @@
+
+# ============================================================
+# SOX4 Gene-Gene Correlation Analysis
+# CD4 Naive / CD8 Naive / CD8 TEM
+# Seurat v5 | Spearman Correlation
+# ============================================================
+
+library(Seurat)
+library(Matrix)
+library(dplyr)
+library(ggplot2)
+library(openxlsx)
+
+# ============================================================
+# 1. Settings
+# ============================================================
+
+stopifnot(inherits(data, "Seurat"))
+
+DefaultAssay(data) <- "RNA"
+
+target_gene <- "SOX4"
+
+target_cells <- c(
+  "CD4 Naive",
+  "CD8 Naive",
+  "CD8 TEM"
+)
+
+celltype_column <- "predicted.celltype.l2"
+
+outdir <- "SOX4_Gene_Correlation"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+min_cells <- 100
+min_gene_cells <- 20
+min_gene_fraction <- 0.01
+
+# ============================================================
+# 2. Join RNA layers (Seurat v5)
+# ============================================================
+
+count_layers <- grep(
+  "^counts",
+  Layers(data[["RNA"]]),
+  value = TRUE
+)
+
+if (length(count_layers) > 1) {
+  data <- JoinLayers(data, assay = "RNA")
+}
+
+# Check normalized layer
+if (!"data" %in% Layers(data[["RNA"]])) {
+  data <- NormalizeData(
+    data,
+    assay = "RNA",
+    verbose = FALSE
+  )
+}
+
+stopifnot(
+  celltype_column %in% colnames(data@meta.data),
+  target_gene %in% rownames(data[["RNA"]])
+)
+
+# ============================================================
+# 3. Spearman correlation function
+# ============================================================
+
+run_sox4_correlation <- function(ct) {
+
+  cat("\n====================================\n")
+  cat("Analyzing:", ct, "\n")
+  cat("====================================\n")
+
+  cells_use <- rownames(data@meta.data)[
+    !is.na(data@meta.data[[celltype_column]]) &
+      data@meta.data[[celltype_column]] == ct
+  ]
+
+  if (length(cells_use) < min_cells) {
+    message("Skipped: insufficient cells")
+    return(NULL)
+  }
+
+  # Extract normalized expression
+  expr <- LayerData(
+    data,
+    assay = "RNA",
+    layer = "data",
+    cells = cells_use
+  )
+
+  # genes x cells
+  sox4 <- as.numeric(expr[target_gene, ])
+
+  if (sd(sox4) == 0) {
+    message("Skipped: SOX4 has no variation")
+    return(NULL)
+  }
+
+  # Filter genes with low detection
+  detection <- Matrix::rowSums(expr > 0)
+
+  keep <- detection >= max(
+    min_gene_cells,
+    ceiling(ncol(expr) * min_gene_fraction)
+  )
+
+  keep[target_gene == rownames(expr)] <- TRUE
+
+  expr <- expr[keep, , drop = FALSE]
+
+  # Rank SOX4 expression
+  sox4_rank <- rank(sox4, ties.method = "average")
+
+  # Calculate gene-wise Spearman correlation
+  # Block processing to avoid large dense matrices
+  genes <- rownames(expr)
+  block_size <- 250
+
+  results <- vector(
+    "list",
+    ceiling(length(genes) / block_size)
+  )
+
+  blocks <- split(
+    seq_along(genes),
+    ceiling(seq_along(genes) / block_size)
+  )
+
+  for (b in seq_along(blocks)) {
+
+    idx <- blocks[[b]]
+
+    mat <- as.matrix(
+      expr[idx, , drop = FALSE]
+    )
+
+    rho <- apply(mat, 1, function(x) {
+      if (sd(x) == 0) return(NA_real_)
+
+      cor(
+        x,
+        sox4,
+        method = "spearman"
+      )
+    })
+
+    # Approximate two-sided p-values
+    n <- length(sox4)
+
+    t_stat <- rho * sqrt(
+      (n - 2) / pmax(1 - rho^2, .Machine$double.eps)
+    )
+
+    pval <- 2 * pt(
+      -abs(t_stat),
+      df = n - 2
+    )
+
+    results[[b]] <- data.frame(
+      Gene = genes[idx],
+      Rho = as.numeric(rho),
+      PValue = as.numeric(pval),
+      Detection_N = as.numeric(detection[genes[idx]])
+    )
+  }
+
+  res <- bind_rows(results) %>%
+    filter(
+      !is.na(Rho),
+      Gene != target_gene
+    ) %>%
+    mutate(
+      FDR = p.adjust(PValue, method = "BH"),
+      CellType = ct,
+      N_Cells = length(cells_use)
+    ) %>%
+    arrange(desc(Rho))
+
+  # ==========================================================
+  # 4. Export results
+  # ==========================================================
+
+  safe_ct <- gsub(" ", "_", ct)
+
+  write.csv(
+    res,
+    file.path(
+      outdir,
+      paste0(safe_ct, "_SOX4_All_Correlations.csv")
+    ),
+    row.names = FALSE
+  )
+
+  positive <- res %>%
+    filter(Rho > 0) %>%
+    arrange(desc(Rho)) %>%
+    slice_head(n = 30)
+
+  negative <- res %>%
+    filter(Rho < 0) %>%
+    arrange(Rho) %>%
+    slice_head(n = 30)
+
+  # ==========================================================
+  # 5. Plot
+  # ==========================================================
+
+  plot_df <- bind_rows(
+    positive %>% mutate(Direction = "Positive"),
+    negative %>% mutate(Direction = "Negative")
+  ) %>%
+    mutate(
+      Gene = factor(
+        Gene,
+        levels = unique(Gene[order(Rho)])
+      )
+    )
+
+  p <- ggplot(
+    plot_df,
+    aes(x = Gene, y = Rho, fill = Direction)
+  ) +
+    geom_col(width = 0.75) +
+    coord_flip() +
+    scale_fill_manual(
+      values = c(
+        "Positive" = "#C44E52",
+        "Negative" = "#4C72B0"
+      )
+    ) +
+    labs(
+      title = paste0("SOX4 Gene Correlation: ", ct),
+      subtitle = paste0(
+        "Spearman correlation | n = ",
+        length(cells_use),
+        " cells"
+      ),
+      x = NULL,
+      y = "Spearman rho"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(face = "bold")
+    )
+
+  ggsave(
+    file.path(
+      outdir,
+      paste0(safe_ct, "_SOX4_Correlation_Top30.pdf")
+    ),
+    p,
+    width = 10,
+    height = 12
+  )
+
+  cat("Cells:", length(cells_use), "\n")
+  cat("Genes tested:", nrow(res), "\n")
+  cat("FDR < 0.05:", sum(res$FDR < 0.05), "\n")
+
+  return(res)
+}
+
+# ============================================================
+# 6. Run all cell types
+# ============================================================
+
+correlation_results <- list()
+
+for (ct in target_cells) {
+
+  correlation_results[[ct]] <-
+    run_sox4_correlation(ct)
+}
+
+# ============================================================
+# 7. Export Excel workbook
+# ============================================================
+
+wb <- createWorkbook()
+
+for (ct in target_cells) {
+
+  res <- correlation_results[[ct]]
+
+  if (is.null(res)) next
+
+  sheet <- gsub(" ", "_", ct)
+
+  addWorksheet(wb, sheet)
+
+  writeData(
+    wb,
+    sheet,
+    res
+  )
+}
+
+saveWorkbook(
+  wb,
+  file.path(
+    outdir,
+    "SOX4_Gene_Correlation_All_CellTypes.xlsx"
+  ),
+  overwrite = TRUE
+)
+
+# ============================================================
+# 8. Upload to Google Cloud Storage
+# ============================================================
+
+system2(
+  "gcloud",
+  c(
+    "storage", "cp", "--recursive",
+    outdir,
+    "gs://scrna_seq/"
+  )
+)
+
+cat("\nAnalysis completed.\n")
