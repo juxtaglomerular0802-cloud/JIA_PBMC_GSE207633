@@ -1,0 +1,1204 @@
+
+# ============================================================
+# SOX4 WGCNA Analysis
+# WITHOUT hdWGCNA / clusterProfiler / systemfonts
+#
+# Cell types:
+#   CD4 Naive
+#   CD8 Naive
+#   CD8 TEM
+#
+# Seurat v5 + WGCNA
+# Patient-aware metacell analysis
+# ============================================================
+
+library(Seurat)
+library(WGCNA)
+library(Matrix)
+library(dplyr)
+library(ggplot2)
+library(openxlsx)
+library(AnnotationDbi)
+library(GO.db)
+library(org.Hs.eg.db)
+
+options(stringsAsFactors = FALSE)
+WGCNA::allowWGCNAThreads(nThreads = 4)
+set.seed(1234)
+
+# ============================================================
+# 1. SETTINGS
+# ============================================================
+
+# WGCNA 내부에서 사용하는 cor 함수 충돌 방지
+cor <- WGCNA::cor
+
+# WGCNA의 correlation function을 명시적으로 사용
+assign(
+  "cor",
+  WGCNA::cor,
+  envir = .GlobalEnv
+)
+
+# 확인
+identical(cor, WGCNA::cor)
+
+stopifnot(
+  exists("data"),
+  inherits(data, "Seurat")
+)
+
+celltype_col <- "predicted.celltype.l2"
+patient_col  <- "Patient"
+group_col    <- "Group"
+target_gene  <- "SOX4"
+
+target_cells <- c(
+  "CD4 Naive",
+  "CD8 Naive",
+  "CD8 TEM"
+)
+
+outdir <- "SOX4_WGCNA"
+dir.create(outdir, showWarnings = FALSE)
+
+stopifnot(all(
+  c(celltype_col, patient_col, group_col) %in%
+    colnames(data@meta.data)
+))
+
+DefaultAssay(data) <- "RNA"
+
+# Analysis parameters
+min_cells_patient <- 50
+metacell_size <- 25
+min_metacells <- 30
+min_patients <- 5
+
+min_gene_fraction <- 0.01
+max_genes <- 3000
+
+min_module_size <- 30
+merge_cut_height <- 0.25
+
+powers <- c(1:10, seq(12, 20, 2))
+
+# ============================================================
+# 2. METACELL FUNCTION
+# ============================================================
+
+make_metacells <- function(
+    obj,
+    genes,
+    patient_col,
+    group_col,
+    metacell_size = 25,
+    min_cells_patient = 50
+) {
+
+  meta <- obj@meta.data
+
+  # Recalculate PCA for this cell type
+  # Do not reuse PCA from the full dataset
+
+  obj <- FindVariableFeatures(
+    obj,
+    nfeatures = 2000,
+    verbose = FALSE
+  )
+
+  obj <- ScaleData(
+    obj,
+    features = VariableFeatures(obj),
+    verbose = FALSE
+  )
+
+  obj <- RunPCA(
+    obj,
+    features = VariableFeatures(obj),
+    npcs = 20,
+    verbose = FALSE
+  )
+
+  pcs <- Embeddings(obj, "pca")
+
+  # Normalized expression
+  expr <- GetAssayData(
+    obj,
+    assay = "RNA",
+    layer = "data"
+  )
+
+  expr <- expr[
+    genes,
+    ,
+    drop = FALSE
+  ]
+
+  patient_ids <- unique(
+    as.character(meta[[patient_col]])
+  )
+
+  result <- list()
+  meta_result <- list()
+
+  for (pid in patient_ids) {
+
+    cells <- rownames(meta)[
+      as.character(meta[[patient_col]]) == pid
+    ]
+
+    cells <- intersect(
+      cells,
+      colnames(expr)
+    )
+
+    if (length(cells) < min_cells_patient) {
+      next
+    }
+
+    patient_groups <- unique(
+      as.character(meta[cells, group_col])
+    )
+
+    patient_groups <- patient_groups[
+      !is.na(patient_groups)
+    ]
+
+    if (length(patient_groups) != 1) {
+      warning(
+        "Skipping patient with ambiguous Group: ",
+        pid
+      )
+      next
+    }
+
+    n_clusters <- floor(
+      length(cells) / metacell_size
+    )
+
+    if (n_clusters < 2) next
+
+    # Each patient clustered separately
+    patient_pcs <- pcs[
+      cells,
+      ,
+      drop = FALSE
+    ]
+
+    km <- kmeans(
+      patient_pcs,
+      centers = n_clusters,
+      iter.max = 50,
+      nstart = 5
+    )
+
+    for (cl in seq_len(n_clusters)) {
+
+      selected <- cells[
+        km$cluster == cl
+      ]
+
+      if (length(selected) < 5) next
+
+      avg <- Matrix::rowMeans(
+        expr[
+          ,
+          selected,
+          drop = FALSE
+        ]
+      )
+
+      mc_name <- paste0(
+        "MC_", pid, "_", cl
+      )
+
+      result[[mc_name]] <- avg
+
+      meta_result[[mc_name]] <- data.frame(
+        Metacell = mc_name,
+        Patient = pid,
+        Group = patient_groups[1],
+        CellCount = length(selected)
+      )
+    }
+  }
+
+  if (length(result) == 0) {
+    stop("No metacells generated.")
+  }
+
+  mat <- do.call(cbind, result)
+
+  mc_meta <- dplyr::bind_rows(
+    meta_result
+  )
+
+  rownames(mc_meta) <- mc_meta$Metacell
+
+  list(
+    expression = t(mat),
+    metadata = mc_meta
+  )
+}
+
+# ============================================================
+# 3. GO BP ENRICHMENT FUNCTION
+# ============================================================
+
+run_go_bp <- function(
+    module_genes,
+    background_genes,
+    ct_dir,
+    ct
+) {
+
+  message("Running GO BP enrichment...")
+
+  # Use propagated GO annotations (GOALL)
+  go_map <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys = unique(background_genes),
+    keytype = "SYMBOL",
+    columns = c("GOALL", "ONTOLOGYALL")
+  )
+
+  go_map <- go_map %>%
+    filter(
+      !is.na(GOALL),
+      ONTOLOGYALL == "BP"
+    ) %>%
+    distinct(SYMBOL, GOALL)
+
+  background <- intersect(
+    unique(background_genes),
+    unique(go_map$SYMBOL)
+  )
+
+  target <- intersect(
+    unique(module_genes),
+    background
+  )
+
+  if (length(target) < 5) {
+    warning("Too few GO-annotated module genes.")
+    return(NULL)
+  }
+
+  term_list <- split(
+    go_map$SYMBOL,
+    go_map$GOALL
+  )
+
+  N <- length(background)
+  n <- length(target)
+
+  results <- lapply(
+    names(term_list),
+    function(go_id) {
+
+      term_genes <- intersect(
+        unique(term_list[[go_id]]),
+        background
+      )
+
+      K <- length(term_genes)
+
+      if (K < 10 || K > 500) {
+        return(NULL)
+      }
+
+      overlap <- intersect(
+        target,
+        term_genes
+      )
+
+      k <- length(overlap)
+
+      # Include zero-overlap terms in multiple testing
+      p <- if (k == 0) {
+        1
+      } else {
+        phyper(
+          k - 1,
+          K,
+          N - K,
+          n,
+          lower.tail = FALSE
+        )
+      }
+
+      data.frame(
+        GO_ID = go_id,
+        Count = k,
+        TermSize = K,
+        BackgroundSize = N,
+        ModuleSize = n,
+        PValue = p,
+        Genes = paste(
+          overlap,
+          collapse = ";"
+        )
+      )
+    }
+  )
+
+  go_df <- dplyr::bind_rows(results)
+
+  if (nrow(go_df) == 0) {
+    warning("No GO terms tested.")
+    return(NULL)
+  }
+
+  go_df$FDR <- p.adjust(
+    go_df$PValue,
+    method = "BH"
+  )
+
+  go_df$Description <- vapply(
+    go_df$GO_ID,
+    function(id) {
+
+      term <- GO.db::GOTERM[[id]]
+
+      if (is.null(term)) {
+        return(NA_character_)
+      }
+
+      GO.db::Term(term)
+    },
+    character(1)
+  )
+
+  go_df <- go_df %>%
+    arrange(FDR, PValue)
+
+  write.csv(
+    go_df,
+    file.path(
+      ct_dir,
+      "SOX4_Module_GO_BP_All.csv"
+    ),
+    row.names = FALSE
+  )
+
+  sig_go <- go_df %>%
+    filter(
+      FDR < 0.05,
+      Count > 0
+    )
+
+  write.csv(
+    sig_go,
+    file.path(
+      ct_dir,
+      "SOX4_Module_GO_BP_Significant.csv"
+    ),
+    row.names = FALSE
+  )
+
+  if (nrow(sig_go) > 0) {
+
+    plot_df <- sig_go %>%
+      slice_head(n = 20) %>%
+      mutate(
+        Description = factor(
+          Description,
+          levels = rev(Description)
+        )
+      )
+
+    p <- ggplot(
+      plot_df,
+      aes(
+        x = Description,
+        y = -log10(pmax(FDR, 1e-300))
+      )
+    ) +
+      geom_col(fill = "steelblue") +
+      coord_flip() +
+      theme_classic(base_size = 12) +
+      labs(
+        title = paste(
+          ct,
+          "SOX4 Module GO BP"
+        ),
+        x = NULL,
+        y = "-log10(FDR)"
+      )
+
+    ggsave(
+      file.path(
+        ct_dir,
+        "SOX4_Module_GO_BP.pdf"
+      ),
+      p,
+      width = 10,
+      height = 8
+    )
+  }
+
+  return(go_df)
+}
+
+# ============================================================
+# 4. MAIN WGCNA FUNCTION
+# ============================================================
+
+run_sox4_wgcna <- function(ct) {
+
+  message("\n====================================")
+  message("Analyzing: ", ct)
+  message("====================================")
+
+  ct_dir <- file.path(
+    outdir,
+    gsub(" ", "_", ct)
+  )
+
+  dir.create(
+    ct_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+  # ----------------------------------------------------------
+  # 4-1. Extract cell type
+  # ----------------------------------------------------------
+
+  meta <- data@meta.data
+
+  cells_use <- rownames(meta)[
+    !is.na(meta[[celltype_col]]) &
+      meta[[celltype_col]] == ct &
+      !is.na(meta[[patient_col]]) &
+      !is.na(meta[[group_col]])
+  ]
+
+  if (length(cells_use) < 500) {
+    stop("Insufficient cells: ", ct)
+  }
+
+  obj <- subset(
+    data,
+    cells = cells_use
+  )
+
+  DefaultAssay(obj) <- "RNA"
+
+  # Seurat v5 layers
+  layers <- Layers(obj[["RNA"]])
+
+  if (
+    length(grep("^counts", layers)) > 1 ||
+    length(grep("^data", layers)) > 1
+  ) {
+
+    obj <- JoinLayers(
+      obj,
+      assay = "RNA"
+    )
+  }
+
+  if (!"data" %in% Layers(obj[["RNA"]])) {
+
+    obj <- NormalizeData(
+      obj,
+      verbose = FALSE
+    )
+  }
+
+  if (!target_gene %in%
+      rownames(obj[["RNA"]])) {
+    stop("SOX4 not found.")
+  }
+
+  # ----------------------------------------------------------
+  # 4-2. Gene selection
+  # ----------------------------------------------------------
+
+  expr <- GetAssayData(
+    obj,
+    assay = "RNA",
+    layer = "data"
+  )
+
+  gene_fraction <- Matrix::rowMeans(
+    expr > 0
+  )
+
+  selected_genes <- names(
+    gene_fraction[
+      gene_fraction >= min_gene_fraction
+    ]
+  )
+
+  if (length(selected_genes) > max_genes) {
+
+    selected_expr <- expr[
+      selected_genes,
+      ,
+      drop = FALSE
+    ]
+
+    avg <- Matrix::rowMeans(
+      selected_expr
+    )
+
+    avg_sq <- Matrix::rowMeans(
+      selected_expr^2
+    )
+
+    variances <- pmax(
+      avg_sq - avg^2,
+      0
+    )
+
+    selected_genes <- names(
+      sort(
+        variances,
+        decreasing = TRUE
+      )
+    )[seq_len(max_genes)]
+  }
+
+  # Keep SOX4 if detected
+  if (
+    is.finite(gene_fraction[target_gene]) &&
+    gene_fraction[target_gene] > 0
+  ) {
+
+    selected_genes <- unique(
+      c(selected_genes, target_gene)
+    )
+  }
+
+  write.csv(
+    data.frame(Gene = selected_genes),
+    file.path(
+      ct_dir,
+      "Selected_Genes.csv"
+    ),
+    row.names = FALSE
+  )
+
+  rm(expr)
+  gc()
+
+  # ----------------------------------------------------------
+  # 4-3. Metacells
+  # ----------------------------------------------------------
+
+  mc <- make_metacells(
+    obj = obj,
+    genes = selected_genes,
+    patient_col = patient_col,
+    group_col = group_col,
+    metacell_size = metacell_size,
+    min_cells_patient = min_cells_patient
+  )
+
+  datExpr <- as.matrix(
+    mc$expression
+  )
+
+  mc_meta <- mc$metadata
+
+  write.csv(
+    mc_meta,
+    file.path(
+      ct_dir,
+      "Metacell_Metadata.csv"
+    ),
+    row.names = FALSE
+  )
+
+  if (nrow(datExpr) < min_metacells) {
+    stop("Insufficient metacells.")
+  }
+
+  if (
+    length(unique(mc_meta$Patient)) <
+    min_patients
+  ) {
+    stop("Insufficient patients.")
+  }
+
+  # ----------------------------------------------------------
+  # 4-4. Quality control
+  # ----------------------------------------------------------
+
+  gsg <- WGCNA::goodSamplesGenes(
+    datExpr,
+    verbose = 0
+  )
+
+  datExpr <- datExpr[
+    gsg$goodSamples,
+    gsg$goodGenes,
+    drop = FALSE
+  ]
+
+  mc_meta <- mc_meta[
+    rownames(datExpr),
+    ,
+    drop = FALSE
+  ]
+
+  if (!target_gene %in% colnames(datExpr)) {
+    warning("SOX4 removed during QC.")
+  }
+
+  # ----------------------------------------------------------
+  # 4-5. Soft threshold selection
+  # ----------------------------------------------------------
+
+  sft <- WGCNA::pickSoftThreshold(
+    datExpr,
+    powerVector = powers,
+    networkType = "signed",
+    verbose = 0
+  )
+
+  fit <- sft$fitIndices
+
+  write.csv(
+    fit,
+    file.path(
+      ct_dir,
+      "Soft_Threshold_Results.csv"
+    ),
+    row.names = FALSE
+  )
+
+  signed_r2 <- -sign(fit$slope) *
+    fit$SFT.R.sq
+
+  pdf(
+    file.path(
+      ct_dir,
+      "Soft_Threshold.pdf"
+    ),
+    width = 10,
+    height = 5
+  )
+
+  par(mfrow = c(1, 2))
+
+  plot(
+    fit$Power,
+    signed_r2,
+    type = "b",
+    xlab = "Soft threshold power",
+    ylab = "Signed scale-free R2"
+  )
+
+  abline(
+    h = 0.8,
+    col = "red",
+    lty = 2
+  )
+
+  plot(
+    fit$Power,
+    fit$mean.k.,
+    type = "b",
+    xlab = "Soft threshold power",
+    ylab = "Mean connectivity"
+  )
+
+  dev.off()
+
+  eligible <- fit$Power[
+    is.finite(signed_r2) &
+      signed_r2 >= 0.8
+  ]
+
+  if (length(eligible) > 0) {
+
+    soft_power <- min(eligible)
+
+  } else {
+
+    soft_power <- 6
+
+    warning(
+      "No power reached R2 >= 0.8. ",
+      "Using exploratory fallback power 6."
+    )
+  }
+
+  message("Soft power: ", soft_power)
+
+  # ----------------------------------------------------------
+  # 4-6. Construct WGCNA network
+  # ----------------------------------------------------------
+
+net <- WGCNA::blockwiseModules(
+  datExpr,
+  power = soft_power,
+  networkType = "signed",
+  TOMType = "signed",
+  corType = "pearson",
+  minModuleSize = min_module_size,
+  mergeCutHeight = merge_cut_height,
+  numericLabels = FALSE,
+  pamRespectsDendro = FALSE,
+  reassignThreshold = 0,
+  saveTOMs = FALSE,
+  verbose = 2
+)
+
+  module_colors <- net$colors
+
+  names(module_colors) <- colnames(datExpr)
+
+  modules <- data.frame(
+    gene = colnames(datExpr),
+    module = module_colors
+  )
+
+  # ----------------------------------------------------------
+  # 4-7. Dendrogram
+  # ----------------------------------------------------------
+
+  if (
+    length(net$dendrograms) > 0
+  ) {
+
+    pdf(
+      file.path(
+        ct_dir,
+        "Module_Dendrogram.pdf"
+      ),
+      width = 12,
+      height = 6
+    )
+
+    for (b in seq_along(net$dendrograms)) {
+
+      block_genes <- net$blockGenes[[b]]
+
+      WGCNA::plotDendroAndColors(
+        net$dendrograms[[b]],
+        module_colors[block_genes],
+        "Module colors",
+        dendroLabels = FALSE,
+        hang = 0.03
+      )
+    }
+
+    dev.off()
+  }
+
+  # ----------------------------------------------------------
+  # 4-8. Module eigengenes
+  # ----------------------------------------------------------
+
+  MEs <- WGCNA::moduleEigengenes(
+    datExpr,
+    colors = module_colors
+  )$eigengenes
+
+  MEs <- WGCNA::orderMEs(MEs)
+
+  kme <- WGCNA::signedKME(
+    datExpr,
+    MEs
+  )
+
+  modules <- cbind(
+    modules,
+    kme
+  )
+
+  write.csv(
+    modules,
+    file.path(
+      ct_dir,
+      "All_Module_Genes.csv"
+    ),
+    row.names = FALSE
+  )
+
+  # ----------------------------------------------------------
+  # 4-9. Identify SOX4 module
+  # ----------------------------------------------------------
+
+  sox4_row <- modules[
+    modules$gene == target_gene,
+    ,
+    drop = FALSE
+  ]
+
+  sox4_module <- NA_character_
+
+  if (nrow(sox4_row) > 0) {
+
+    sox4_module <- as.character(
+      sox4_row$module[1]
+    )
+
+    message(
+      "SOX4 module: ",
+      sox4_module
+    )
+
+    write.csv(
+      sox4_row,
+      file.path(
+        ct_dir,
+        "SOX4_Module_Info.csv"
+      ),
+      row.names = FALSE
+    )
+
+    if (sox4_module != "grey") {
+
+      module_genes <- modules %>%
+        filter(
+          module == sox4_module
+        )
+
+      write.csv(
+        module_genes,
+        file.path(
+          ct_dir,
+          "SOX4_Module_Genes.csv"
+        ),
+        row.names = FALSE
+      )
+
+      # ------------------------------------------------------
+      # 4-10. Hub genes
+      # ------------------------------------------------------
+
+      kme_col <- paste0(
+        "kME",
+        sox4_module
+      )
+
+      if (
+        kme_col %in%
+        colnames(module_genes)
+      ) {
+
+        hubs <- module_genes %>%
+          arrange(
+            desc(.data[[kme_col]])
+          )
+
+        write.csv(
+          head(hubs, 30),
+          file.path(
+            ct_dir,
+            "SOX4_Module_Top30_Hubs.csv"
+          ),
+          row.names = FALSE
+        )
+
+        # SOX4 hub ranking
+        sox4_rank <- match(
+          target_gene,
+          hubs$gene
+        )
+
+        write.csv(
+          data.frame(
+            CellType = ct,
+            SOX4_Module = sox4_module,
+            SOX4_kME = sox4_row[[kme_col]][1],
+            SOX4_HubRank = sox4_rank,
+            ModuleSize = nrow(hubs)
+          ),
+          file.path(
+            ct_dir,
+            "SOX4_Hub_Ranking.csv"
+          ),
+          row.names = FALSE
+        )
+      }
+
+      # ------------------------------------------------------
+      # 4-11. GO enrichment
+      # ------------------------------------------------------
+
+      tryCatch(
+        run_go_bp(
+          module_genes = module_genes$gene,
+          background_genes = colnames(datExpr),
+          ct_dir = ct_dir,
+          ct = ct
+        ),
+        error = function(e) {
+          warning(
+            "GO enrichment failed: ",
+            conditionMessage(e)
+          )
+        }
+      )
+
+    } else {
+
+      message(
+        "SOX4 assigned to grey module."
+      )
+    }
+
+  } else {
+
+    message(
+      "SOX4 not assigned to a module."
+    )
+  }
+
+  # ----------------------------------------------------------
+  # 4-12. Patient-level module eigengenes
+  # ----------------------------------------------------------
+
+  me_df <- data.frame(
+    Metacell = rownames(MEs),
+    MEs,
+    check.names = FALSE
+  )
+
+  me_df <- dplyr::left_join(
+    me_df,
+    mc_meta,
+    by = "Metacell"
+  )
+
+  me_cols <- colnames(MEs)
+
+  patient_me <- me_df %>%
+    group_by(
+      Patient,
+      Group
+    ) %>%
+    summarise(
+      across(
+        all_of(me_cols),
+        mean,
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    )
+
+  write.csv(
+    patient_me,
+    file.path(
+      ct_dir,
+      "Patient_Level_Module_Eigengenes.csv"
+    ),
+    row.names = FALSE
+  )
+
+  # ----------------------------------------------------------
+  # 4-13. Active vs LungDisease
+  # ----------------------------------------------------------
+
+  if (
+    !is.na(sox4_module) &&
+    sox4_module != "grey"
+  ) {
+
+    me_target <- paste0(
+      "ME",
+      sox4_module
+    )
+
+    if (
+      me_target %in%
+      colnames(patient_me)
+    ) {
+
+      plot_df <- patient_me %>%
+        filter(
+          Group %in% c(
+            "Active",
+            "LungDisease"
+          )
+        ) %>%
+        mutate(
+          Group = factor(
+            Group,
+            levels = c(
+              "Active",
+              "LungDisease"
+            )
+          )
+        )
+
+      group_n <- table(
+        plot_df$Group
+      )
+
+      if (
+        all(group_n >= 2)
+      ) {
+
+        p <- ggplot(
+          plot_df,
+          aes(
+            x = Group,
+            y = .data[[me_target]],
+            fill = Group
+          )
+        ) +
+          geom_boxplot(
+            alpha = 0.35,
+            outlier.shape = NA
+          ) +
+          geom_jitter(
+            width = 0.12,
+            size = 2
+          ) +
+          theme_classic(
+            base_size = 13
+          ) +
+          labs(
+            title = paste(
+              ct,
+              "SOX4 Module Activity"
+            ),
+            x = NULL,
+            y = "Module eigengene"
+          ) +
+          theme(
+            legend.position = "none"
+          )
+
+        ggsave(
+          file.path(
+            ct_dir,
+            "SOX4_Module_Active_vs_LD.pdf"
+          ),
+          p,
+          width = 6,
+          height = 5
+        )
+
+        test <- wilcox.test(
+          plot_df[[me_target]] ~
+            plot_df$Group,
+          exact = FALSE
+        )
+
+        write.csv(
+          data.frame(
+            CellType = ct,
+            Module = sox4_module,
+            Active_N = unname(
+              group_n["Active"]
+            ),
+            LungDisease_N = unname(
+              group_n["LungDisease"]
+            ),
+            PValue = test$p.value
+          ),
+          file.path(
+            ct_dir,
+            "SOX4_Module_Group_Test.csv"
+          ),
+          row.names = FALSE
+        )
+      }
+    }
+  }
+
+  # ----------------------------------------------------------
+  # 4-14. Save results
+  # ----------------------------------------------------------
+
+  saveRDS(
+    list(
+      modules = modules,
+      eigengenes = MEs,
+      patient_eigengenes = patient_me,
+      metacell_metadata = mc_meta,
+      soft_power = soft_power,
+      sox4_module = sox4_module
+    ),
+    file.path(
+      ct_dir,
+      "WGCNA_Result.rds"
+    )
+  )
+
+  rm(obj, datExpr, net)
+  gc()
+
+  message(
+    "Completed: ",
+    ct
+  )
+}
+
+# ============================================================
+# 5. RUN ALL CELL TYPES
+# ============================================================
+
+analysis_status <- list()
+
+for (ct in c("CD4 Naive", "CD8 Naive", "CD8 TEM")) {
+
+  analysis_status[[ct]] <- tryCatch(
+    {
+      run_sox4_wgcna(ct)
+      "Completed"
+    },
+    error = function(e) {
+      paste("Failed:", conditionMessage(e))
+    }
+  )
+
+  print(analysis_status[[ct]])
+}
+
+  analysis_status[[ct]] <- result
+
+  gc()
+}
+
+# ============================================================
+# 6. SAVE ANALYSIS STATUS
+# ============================================================
+
+status_df <- data.frame(
+  CellType = names(analysis_status),
+  Status = unlist(
+    analysis_status,
+    use.names = FALSE
+  )
+)
+
+write.csv(
+  status_df,
+  file.path(
+    outdir,
+    "Analysis_Status.csv"
+  ),
+  row.names = FALSE
+)
+
+print(status_df)
+
+message(
+  "\nAll WGCNA analyses finished."
+)
+
+# ============================================================
+# 7. OPTIONAL: UPLOAD RESULTS TO GCS
+# ============================================================
+
+# Requires gsutil or gcloud storage CLI.
+# Uncomment after analysis.
+
+# system2(
+#   "gsutil",
+#   c(
+#     "-m", "cp", "-r",
+#     shQuote(outdir),
+#     "gs://scrna_seq/"
+#   )
+# )
