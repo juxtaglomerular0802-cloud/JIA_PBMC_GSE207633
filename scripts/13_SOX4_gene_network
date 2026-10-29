@@ -1153,12 +1153,10 @@ for (ct in c("CD4 Naive", "CD8 Naive", "CD8 TEM")) {
   )
 
   print(analysis_status[[ct]])
-}
-
-  analysis_status[[ct]] <- result
 
   gc()
 }
+
 
 # ============================================================
 # 6. SAVE ANALYSIS STATUS
@@ -1194,11 +1192,11 @@ message(
 # Requires gsutil or gcloud storage CLI.
 # Uncomment after analysis.
 
-# system2(
-#   "gsutil",
-#   c(
-#     "-m", "cp", "-r",
-#     shQuote(outdir),
-#     "gs://scrna_seq/"
-#   )
-# )
+ system2(
+   "gsutil",
+   c(
+     "-m", "cp", "-r",
+     shQuote(outdir),
+     "gs://scrna_seq/"
+   )
+ )
