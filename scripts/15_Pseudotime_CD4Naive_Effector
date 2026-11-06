@@ -160,19 +160,18 @@ if(any(lengths(signatures) < 3)) {
 }
 
 # Module scores
-for(nm in names(signatures)) {
-  if(length(signatures[[nm]]) < 3) next
+for (nm in names(signatures)) {
+  if (length(signatures[[nm]]) < 3) next
 
   obj <- AddModuleScore(
     obj,
-    features=list(signatures[[nm]]),
-    name=paste0(nm, "_"),
-    assay="RNA",
-    seed=20261106
+    features = list(signatures[[nm]]),
+    name = paste0(nm, "_"),
+    assay = "RNA",
+    seed = 20261106
   )
 
-  obj[[nm]] <- obj@meta.data[
-    [paste0(nm, "_1")]]
+  obj[[nm]] <- obj@meta.data[[paste0(nm, "_1")]]
 }
 
 # ============================================================
