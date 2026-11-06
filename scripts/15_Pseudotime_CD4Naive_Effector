@@ -1,0 +1,578 @@
+
+# ============================================================
+# CD4 Naive Internal State Trajectory
+# Naive-like -> Effector-associated transition
+# Slingshot / Patient-level / SOX4
+# ============================================================
+
+required <- c(
+  "Seurat", "SeuratObject", "Matrix",
+  "SingleCellExperiment", "slingshot",
+  "ggplot2", "dplyr", "tidyr", "tibble",
+  "openxlsx", "S4Vectors"
+)
+
+missing <- required[
+  !vapply(required, requireNamespace, logical(1), quietly=TRUE)
+]
+if(length(missing)) stop("Missing: ", paste(missing, collapse=", "))
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Matrix)
+  library(SingleCellExperiment)
+  library(slingshot)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(openxlsx)
+})
+
+set.seed(20261106)
+
+# ============================================================
+# 1. Input / output
+# ============================================================
+
+input_file <- "GSE207633_RPCA_Azimuth_annotated_res0.6.rds"
+if(!file.exists(input_file)) input_file <- file.choose()
+
+outdir <- "CD4_Naive_Effector_Trajectory"
+plotdir <- file.path(outdir, "Plots")
+dir.create(plotdir, recursive=TRUE, showWarnings=FALSE)
+
+groups <- c("Healthy", "Inactive", "Active", "LungDisease")
+n_pcs <- 20
+resolution <- 0.4
+min_cells_patient <- 20
+
+# ============================================================
+# 2. CD4 Naive only
+# ============================================================
+
+obj <- readRDS(input_file)
+DefaultAssay(obj) <- "RNA"
+
+m <- obj@meta.data
+
+stopifnot(all(
+  c("Patient", "Group", "predicted.celltype.l2") %in%
+    colnames(m)
+))
+
+keep <- rownames(m)[
+  !is.na(m$Patient) &
+  !is.na(m$Group) &
+  m$Group %in% groups &
+  !is.na(m$predicted.celltype.l2) &
+  m$predicted.celltype.l2 == "CD4 Naive"
+]
+
+obj <- subset(obj, cells=keep)
+
+obj$Patient <- as.character(obj$Patient)
+obj$Group <- as.character(obj$Group)
+obj$CellType <- as.character(obj$predicted.celltype.l2)
+
+# ============================================================
+# 3. Normalize and re-cluster
+# SOX4 excluded from PCA
+# ============================================================
+
+if(any(grepl("^counts\\.", Layers(obj[["RNA"]])))) {
+  obj <- JoinLayers(obj, assay="RNA")
+}
+
+obj <- NormalizeData(obj, verbose=FALSE)
+obj <- FindVariableFeatures(
+  obj,
+  selection.method="vst",
+  nfeatures=2500,
+  verbose=FALSE
+)
+
+trajectory_genes <- setdiff(VariableFeatures(obj), "SOX4")
+VariableFeatures(obj) <- trajectory_genes
+
+obj <- ScaleData(
+  obj,
+  features=trajectory_genes,
+  verbose=FALSE
+)
+
+obj <- RunPCA(
+  obj,
+  features=trajectory_genes,
+  npcs=30,
+  verbose=FALSE
+)
+
+obj <- FindNeighbors(
+  obj,
+  dims=1:n_pcs,
+  verbose=FALSE
+)
+
+obj <- FindClusters(
+  obj,
+  resolution=resolution,
+  verbose=FALSE
+)
+
+obj <- RunUMAP(
+  obj,
+  dims=1:n_pcs,
+  verbose=FALSE
+)
+
+obj$StateCluster <- as.character(Idents(obj))
+
+# ============================================================
+# 4. Marker signatures
+# ============================================================
+
+signatures <- list(
+  Naive_Identity = c(
+    "TCF7", "LEF1", "CCR7",
+    "SELL", "BACH2", "MAL"
+  ),
+  Activation = c(
+    "CD69", "IL2RA", "CD38",
+    "HLA-DRA", "ICOS"
+  ),
+  Effector_Associated = c(
+    "TBX21", "PRDM1", "IFNG",
+    "GZMB", "CCL5", "NKG7"
+  )
+)
+
+# Use only genes present in RNA assay
+signatures <- lapply(
+  signatures,
+  function(x) intersect(x, rownames(obj))
+)
+
+print(signatures)
+
+if(any(lengths(signatures) < 3)) {
+  warning("Some signatures contain fewer than 3 genes")
+}
+
+# Module scores
+for(nm in names(signatures)) {
+  if(length(signatures[[nm]]) < 3) next
+
+  obj <- AddModuleScore(
+    obj,
+    features=list(signatures[[nm]]),
+    name=paste0(nm, "_"),
+    assay="RNA",
+    seed=20261106
+  )
+
+  obj[[nm]] <- obj@meta.data[
+    [paste0(nm, "_1")]
+  ]
+}
+
+# ============================================================
+# 5. Cluster-level signature summaries
+# ============================================================
+
+score_cols <- intersect(
+  names(signatures),
+  colnames(obj@meta.data)
+)
+
+if(!all(c("Naive_Identity",
+          "Effector_Associated") %in% score_cols)) {
+  stop("Naive/Effector signatures unavailable")
+}
+
+cluster_summary <- obj@meta.data %>%
+  group_by(StateCluster) %>%
+  summarise(
+    N_Cells=n(),
+    N_Patients=n_distinct(Patient),
+    across(
+      all_of(score_cols),
+      mean,
+      .names="{.col}"
+    ),
+    .groups="drop"
+  )
+
+print(cluster_summary)
+
+# Root = highest naive identity score
+# SOX4 and disease labels are not used.
+
+root_cluster <- cluster_summary %>%
+  arrange(desc(Naive_Identity)) %>%
+  slice(1) %>%
+  pull(StateCluster)
+
+cat("Proposed root cluster:", root_cluster, "\n")
+
+# ============================================================
+# 6. Slingshot in PCA space
+# ============================================================
+
+pca <- Embeddings(obj, "pca")[
+  , 1:n_pcs, drop=FALSE
+]
+
+sce <- SingleCellExperiment(
+  assays=list(
+    logcounts=matrix(
+      0,
+      nrow=1,
+      ncol=ncol(obj),
+      dimnames=list("placeholder", colnames(obj))
+    )
+  )
+)
+
+reducedDims(sce) <- S4Vectors::SimpleList(PCA=pca)
+
+sce <- slingshot(
+  sce,
+  clusterLabels=obj$StateCluster,
+  reducedDim="PCA",
+  start.clus=root_cluster,
+  approx_points=150
+)
+
+print(slingLineages(sce))
+
+pt_mat <- slingPseudotime(sce, na=TRUE)
+weight_mat <- slingCurveWeights(sce)
+
+# Retain all lineages; do not merge them.
+for(i in seq_len(ncol(pt_mat))) {
+
+  nm <- paste0("PT_Lineage", i)
+
+  x <- as.numeric(pt_mat[,i])
+
+  if(sum(is.finite(x)) > 1 &&
+     diff(range(x, na.rm=TRUE)) > 0) {
+
+    x <- (x-min(x,na.rm=TRUE)) /
+      diff(range(x,na.rm=TRUE))
+  }
+
+  obj[[nm]] <- x
+  obj[[paste0("Weight_Lineage",i)]] <-
+    as.numeric(weight_mat[,i])
+}
+
+# ============================================================
+# 7. SOX4 expression
+# ============================================================
+
+expr <- LayerData(obj, assay="RNA", layer="data")
+
+stopifnot("SOX4" %in% rownames(expr))
+
+obj$SOX4 <- as.numeric(
+  expr["SOX4", colnames(obj)]
+)
+
+obj$SOX4_Positive <- obj$SOX4 > 0
+
+# ============================================================
+# 8. Cell-level table
+# ============================================================
+
+cell_df <- obj@meta.data %>%
+  rownames_to_column("Cell") %>%
+  mutate(
+    Group=factor(Group, levels=groups)
+  )
+
+xy <- as.data.frame(
+  Embeddings(obj,"umap")[,1:2,drop=FALSE]
+) %>%
+  rownames_to_column("Cell")
+
+colnames(xy)[2:3] <- c("UMAP1","UMAP2")
+
+cell_df <- left_join(cell_df,xy,by="Cell")
+
+# ============================================================
+# 9. Patient-level summary for each lineage
+# ============================================================
+
+pt_cols <- grep(
+  "^PT_Lineage",
+  colnames(cell_df),
+  value=TRUE
+)
+
+patient_results <- bind_rows(lapply(pt_cols,function(nm) {
+
+  cell_df %>%
+    filter(is.finite(.data[[nm]])) %>%
+    group_by(Group,Patient) %>%
+    summarise(
+      N_Cells=n(),
+      Median_PT=median(.data[[nm]]),
+      Mean_PT=mean(.data[[nm]]),
+      SOX4_Detection=100*mean(SOX4_Positive),
+      Naive_Score=mean(Naive_Identity),
+      Effector_Score=mean(Effector_Associated),
+      .groups="drop"
+    ) %>%
+    mutate(Lineage=nm)
+
+}))
+
+# ============================================================
+# 10. Figures
+# ============================================================
+
+plots <- list()
+
+plots[["01_UMAP_Clusters"]] <-
+  ggplot(cell_df,aes(UMAP1,UMAP2,color=StateCluster)) +
+  geom_point(size=.25,alpha=.6) +
+  theme_bw() +
+  labs(title="CD4 Naive internal clusters")
+
+plots[["02_UMAP_Groups"]] <-
+  ggplot(cell_df,aes(UMAP1,UMAP2,color=Group)) +
+  geom_point(size=.2,alpha=.5) +
+  facet_wrap(~Group) +
+  theme_bw()
+
+for(nm in c(score_cols,"SOX4")) {
+
+  plots[[paste0("UMAP_",nm)]] <-
+    ggplot(cell_df,aes(
+      UMAP1,UMAP2,color=.data[[nm]]
+    )) +
+    geom_point(size=.25,alpha=.7) +
+    scale_color_viridis_c() +
+    theme_bw() +
+    labs(title=nm)
+}
+
+for(nm in pt_cols) {
+
+  # UMAP pseudotime
+  plots[[paste0(nm,"_UMAP")]] <-
+    ggplot(
+      cell_df %>% filter(is.finite(.data[[nm]])),
+      aes(UMAP1,UMAP2,color=.data[[nm]])
+    ) +
+    geom_point(size=.25,alpha=.7) +
+    scale_color_viridis_c() +
+    theme_bw() +
+    labs(title=nm,color="Pseudotime")
+
+  # Group-wise cell-level distribution
+  plots[[paste0(nm,"_Violin")]] <-
+    ggplot(
+      cell_df %>% filter(is.finite(.data[[nm]])),
+      aes(Group,.data[[nm]],fill=Group)
+    ) +
+    geom_violin(trim=TRUE,alpha=.6) +
+    geom_boxplot(
+      width=.15,
+      fill="white",
+      outlier.shape=NA
+    ) +
+    theme_bw() +
+    theme(legend.position="none") +
+    labs(x=NULL,y="Pseudotime",title=nm)
+
+  # SOX4 vs pseudotime
+  plots[[paste0(nm,"_SOX4")]] <-
+    ggplot(
+      cell_df %>% filter(is.finite(.data[[nm]])),
+      aes(.data[[nm]],SOX4,color=Group)
+    ) +
+    geom_point(alpha=.15,size=.3) +
+    geom_smooth(method="loess",se=FALSE) +
+    facet_wrap(~Group) +
+    theme_bw() +
+    labs(x="Pseudotime",y="SOX4 expression")
+
+  # Signature trends
+  score_long <- cell_df %>%
+    filter(is.finite(.data[[nm]])) %>%
+    select(
+      Group,
+      all_of(nm),
+      all_of(score_cols)
+    ) %>%
+    pivot_longer(
+      cols=all_of(score_cols),
+      names_to="Signature",
+      values_to="Score"
+    )
+
+  plots[[paste0(nm,"_Signatures")]] <-
+    ggplot(
+      score_long,
+      aes(.data[[nm]],Score,color=Group)
+    ) +
+    geom_smooth(
+      method="loess",
+      se=FALSE
+    ) +
+    facet_wrap(~Signature,scales="free_y") +
+    theme_bw() +
+    labs(
+      x="Pseudotime",
+      title="Transcriptional programs along trajectory"
+    )
+}
+
+# Save plots
+for(nm in names(plots)) {
+
+  ggsave(
+    file.path(plotdir,paste0(nm,".png")),
+    plots[[nm]],
+    width=9,height=6,dpi=300
+  )
+
+  ggsave(
+    file.path(plotdir,paste0(nm,".pdf")),
+    plots[[nm]],
+    width=9,height=6
+  )
+}
+
+# ============================================================
+# 11. PCA-space Slingshot curves
+# ============================================================
+
+pca_df <- data.frame(
+  PC1=pca[,1],
+  PC2=pca[,2],
+  Cluster=obj$StateCluster
+)
+
+p_curve <- ggplot(
+  pca_df,
+  aes(PC1,PC2,color=Cluster)
+) +
+  geom_point(size=.2,alpha=.35)
+
+for(curve in slingCurves(sce)) {
+
+  line <- as.data.frame(
+    curve$s[,1:2,drop=FALSE]
+  )
+
+  colnames(line) <- c("PC1","PC2")
+
+  p_curve <- p_curve +
+    geom_path(
+      data=line,
+      aes(PC1,PC2),
+      inherit.aes=FALSE,
+      color="black",
+      linewidth=1
+    )
+}
+
+p_curve <- p_curve +
+  theme_bw() +
+  labs(title="Slingshot trajectories in PCA space")
+
+ggsave(
+  file.path(plotdir,"PCA_Slingshot.png"),
+  p_curve,width=9,height=6,dpi=300
+)
+
+ggsave(
+  file.path(plotdir,"PCA_Slingshot.pdf"),
+  p_curve,width=9,height=6
+)
+
+# ============================================================
+# 12. Excel
+# ============================================================
+
+wb <- createWorkbook()
+
+add_sheet <- function(name,x) {
+  addWorksheet(wb,name)
+  writeDataTable(wb,name,as.data.frame(x))
+  freezePane(wb,name,firstRow=TRUE)
+}
+
+add_sheet("Cluster_Signatures",cluster_summary)
+add_sheet("Patient_Results",patient_results)
+add_sheet("Cell_Level",cell_df)
+
+lineage_table <- tibble(
+  Lineage=names(slingLineages(sce)),
+  Cluster_Path=vapply(
+    slingLineages(sce),
+    paste,
+    collapse=" -> ",
+    FUN.VALUE=character(1)
+  )
+)
+
+add_sheet("Lineages",lineage_table)
+
+saveWorkbook(
+  wb,
+  file.path(outdir,"CD4_Naive_Effector_Trajectory.xlsx"),
+  overwrite=TRUE
+)
+
+saveRDS(
+  list(
+    obj=obj,
+    sce=sce,
+    root_cluster=root_cluster,
+    cluster_summary=cluster_summary,
+    signatures=signatures,
+    trajectory_genes=trajectory_genes
+  ),
+  file.path(outdir,"Trajectory_Objects.rds")
+)
+
+# ============================================================
+# 13. Upload to GCS
+# ============================================================
+
+dest <- "gs://scrna_seq/CD4_Naive_Effector_Trajectory/"
+
+if(nzchar(Sys.which("gcloud"))) {
+
+  status <- system2(
+    "gcloud",
+    c(
+      "storage","rsync","--recursive",
+      shQuote(normalizePath(outdir)),
+      shQuote(dest)
+    )
+  )
+
+} else if(nzchar(Sys.which("gsutil"))) {
+
+  status <- system2(
+    "gsutil",
+    c(
+      "-m","rsync","-r",
+      shQuote(normalizePath(outdir)),
+      shQuote(dest)
+    )
+  )
+
+} else {
+  stop("gcloud/gsutil not available")
+}
+
+if(status != 0) stop("GCS upload failed")
+
+cat("Finished and uploaded:",dest,"\n")
