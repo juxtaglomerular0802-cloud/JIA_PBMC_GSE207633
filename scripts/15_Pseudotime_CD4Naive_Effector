@@ -172,8 +172,7 @@ for(nm in names(signatures)) {
   )
 
   obj[[nm]] <- obj@meta.data[
-    [paste0(nm, "_1")]
-  ]
+    [paste0(nm, "_1")]]
 }
 
 # ============================================================
