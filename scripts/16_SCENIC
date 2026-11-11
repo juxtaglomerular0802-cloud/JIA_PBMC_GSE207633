@@ -1,0 +1,553 @@
+
+# ============================================================
+# SOX4-centered SCENIC analysis
+# GSE207633 / CD4 Naive / Seurat v5
+# Healthy, Inactive, Active, LungDisease
+# Output -> Google Cloud Storage
+# ============================================================
+
+# ------------------------------------------------------------
+# 0. Packages
+# ------------------------------------------------------------
+required <- c(
+  "Seurat", "SeuratObject", "SCENIC",
+  "GENIE3", "RcisTarget", "AUCell",
+  "dplyr", "ggplot2", "openxlsx",
+  "Matrix", "data.table", "doRNG"
+)
+
+missing <- required[
+  !vapply(required, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing) > 0) {
+  stop(
+    "Missing packages: ",
+    paste(missing, collapse = ", "),
+    "\nInstall these before proceeding."
+  )
+}
+
+library(Seurat)
+library(SCENIC)
+library(RcisTarget)
+library(doRNG)
+library(dplyr)
+library(ggplot2)
+library(openxlsx)
+
+set.seed(1234)
+
+# ------------------------------------------------------------
+# 1. Settings
+# ------------------------------------------------------------
+rds_path <- "GSE207633_RPCA_Azimuth_annotated_res0.6.rds"
+
+# Use an absolute output directory to prevent nested setwd() problems.
+project_root <- if (basename(getwd()) == "SCENIC_CD4_Naive_SOX4") dirname(getwd()) else getwd()
+outdir <- file.path(project_root, "SCENIC_CD4_Naive_SOX4")
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+# Set to the directory containing hg38 motif feather files.
+dbDir <- "/home/juxtaglomerular0802/cisTarget_databases"
+
+# Use the actual filenames in dbDir.
+dbs <- c(
+  "hg38__refseq-r80__500bp_up_and_100bp_down_tss.mc9nr.feather",
+  "hg38__refseq-r80__10kb_up_and_down_tss.mc9nr.feather"
+)
+
+bucket <- "gs://scrna_seq"
+
+groups <- c(
+  "Healthy", "Inactive", "Active", "LungDisease"
+)
+
+nCores <- 4
+max_cells_per_patient <- 500
+min_cells_per_patient <- 20
+
+# ------------------------------------------------------------
+# 2. Load Seurat object
+# ------------------------------------------------------------
+if (!exists("data") || !inherits(data, "Seurat")) {
+  data <- readRDS(file.path(project_root, rds_path))
+}
+
+stopifnot(inherits(data, "Seurat"))
+
+required_meta <- c(
+  "Patient", "Group", "predicted.celltype.l2"
+)
+
+stopifnot(
+  all(required_meta %in% colnames(data@meta.data))
+)
+
+DefaultAssay(data) <- "RNA"
+
+# Join Seurat v5 layers if necessary
+count_layers <- grep(
+  "^counts",
+  Layers(data[["RNA"]]),
+  value = TRUE
+)
+
+if (length(count_layers) > 1) {
+  data <- JoinLayers(data, assay = "RNA")
+}
+
+# ------------------------------------------------------------
+# 3. Subset CD4 Naive
+# ------------------------------------------------------------
+meta <- data@meta.data
+
+keep <- rownames(meta)[
+  !is.na(meta$Patient) &
+  meta$Group %in% groups &
+  meta$predicted.celltype.l2 == "CD4 Naive"
+]
+
+stopifnot(length(keep) > 0)
+
+sub <- subset(data, cells = keep)
+
+sub$Patient <- as.character(sub$Patient)
+sub$Group <- as.character(sub$Group)
+
+# Patient-level sampling to reduce cell imbalance
+sampled_cells <- unlist(
+  lapply(split(Cells(sub), sub$Patient), function(x) {
+    if (length(x) < min_cells_per_patient) {
+      return(character(0))
+    }
+    sample(x, min(length(x), max_cells_per_patient))
+  }),
+  use.names = FALSE
+)
+
+if (length(sampled_cells) == 0) {
+  stop("No patients passed minimum cell threshold.")
+}
+
+sub <- subset(sub, cells = sampled_cells)
+
+meta <- sub@meta.data
+
+write.xlsx(
+  as.data.frame(
+    table(meta$Group, meta$Patient)
+  ),
+  file.path(outdir, "01_Patient_Cell_Counts.xlsx")
+)
+
+# ------------------------------------------------------------
+# 4. Expression matrix
+# ------------------------------------------------------------
+exprMat <- GetAssayData(
+  sub,
+  assay = "RNA",
+  layer = "counts"
+)
+
+if (!"SOX4" %in% rownames(exprMat)) {
+  stop("SOX4 not found in RNA counts.")
+}
+
+# SCENIC uses gene x cell count matrix
+# Keep sparse matrix to reduce RAM use.
+if (!inherits(exprMat, "dgCMatrix")) {
+  exprMat <- as(exprMat, "dgCMatrix")
+}
+
+# ------------------------------------------------------------
+# 5. Initialize SCENIC
+# ------------------------------------------------------------
+db_paths <- file.path(dbDir, dbs)
+print(data.frame(File = dbs, Exists = file.exists(db_paths),
+                 Size_GB = round(file.size(db_paths) / 1024^3, 2)))
+if (!all(file.exists(db_paths))) {
+  stop("Motif databases missing. Verify dbDir and filenames above.")
+}
+
+# mc9nr requires the v9 motif annotation.
+data("motifAnnotations_hgnc_v9", package = "RcisTarget", envir = .GlobalEnv)
+stopifnot(exists("motifAnnotations_hgnc_v9", envir = .GlobalEnv))
+motifAnnotations_hgnc <- get("motifAnnotations_hgnc_v9", envir = .GlobalEnv)
+
+oldwd <- getwd()
+setwd(outdir)
+
+scenicOptions <- initializeScenic(
+  org = "hgnc",
+  dbDir = dbDir,
+  dbs = dbs,
+  datasetTitle = "GSE207633_CD4_Naive",
+  nCores = nCores
+)
+
+# ------------------------------------------------------------
+# 6. Gene filtering
+# ------------------------------------------------------------
+library(Matrix)
+
+# 1. Filtering thresholds
+minCountsPerGene <- 3 * 0.01 * ncol(exprMat)
+minSamples <- 0.01 * ncol(exprMat)
+
+# 2. Gene filtering
+gene_counts <- Matrix::rowSums(exprMat)
+gene_samples <- Matrix::rowSums(exprMat > 0)
+
+genesKept <- rownames(exprMat)[
+  gene_counts >= minCountsPerGene &
+  gene_samples >= minSamples
+]
+
+# 3. Filter expression matrix
+exprFiltered <- exprMat[genesKept, , drop = FALSE]
+
+# 4. Save results
+saveRDS(
+  genesKept,
+  "SCENIC_Filtered_Genes.rds"
+)
+
+saveRDS(
+  exprFiltered,
+  "SCENIC_Filtered_Expression.rds"
+)
+
+# 5. Check
+cat("Original genes:", nrow(exprMat), "\n")
+cat("Filtered genes:", nrow(exprFiltered), "\n")
+cat("Cells:", ncol(exprFiltered), "\n")
+cat("SOX4 retained:", "SOX4" %in% genesKept, "\n")
+
+# ------------------------------------------------------------
+# 7. Correlation and GENIE3 (slow; skip if already completed successfully)
+# ------------------------------------------------------------
+# Sparse matrix → dense matrix
+exprDense <- as.matrix(exprFiltered)
+
+# Correlation
+runCorrelation(
+  exprDense,
+  scenicOptions
+)
+
+# Memory cleanup
+rm(exprDense)
+gc()
+
+# 1. Sparse → Dense
+exprDense <- as.matrix(exprFiltered)
+
+# 2. GENIE3 실행
+runGenie3(
+  exprDense,
+  scenicOptions
+)
+
+# 3. 완료 후 메모리 정리
+rm(exprDense)
+gc()
+
+# ------------------------------------------------------------
+# 8. Regulon inference
+# ------------------------------------------------------------
+scenicOptions <- runSCENIC_1_coexNetwork2modules(
+  scenicOptions
+)
+
+scenicOptions <- runSCENIC_2_createRegulons(
+  scenicOptions
+)
+
+# ------------------------------------------------------------
+# 9. AUCell regulon activity
+# ------------------------------------------------------------
+scenicOptions <- runSCENIC_3_scoreCells(
+  scenicOptions,
+  exprMat
+)
+
+saveRDS(
+  scenicOptions,
+  "SCENIC_Options_Final.rds"
+)
+
+# ------------------------------------------------------------
+# 10. Extract regulon activity
+# ------------------------------------------------------------
+auc <- loadInt(
+  scenicOptions,
+  "aucell_regulonAUC"
+)
+
+auc_mat <- AUCell::getAUC(auc)
+
+# Cells x regulons
+auc_df <- as.data.frame(t(auc_mat))
+auc_df$Cell <- rownames(auc_df)
+
+meta$Cell <- rownames(meta)
+
+auc_df <- merge(
+  auc_df,
+  meta[, c("Cell", "Patient", "Group")],
+  by = "Cell",
+  sort = FALSE
+)
+
+saveRDS(
+  auc_mat,
+  "SCENIC_Regulon_AUC.rds"
+)
+
+# ------------------------------------------------------------
+# 11. Identify SOX4 regulons
+# ------------------------------------------------------------
+sox4_cols <- grep(
+  "^SOX4\\s*\\(",
+  colnames(auc_df),
+  value = TRUE
+)
+
+write.xlsx(
+  data.frame(SOX4_Regulon = sox4_cols),
+  "02_SOX4_Regulons.xlsx"
+)
+
+if (length(sox4_cols) == 0) {
+  warning(
+    "SOX4 regulon was not inferred. ",
+    "Other regulons remain available."
+  )
+}
+
+# ------------------------------------------------------------
+# 12. Patient-level regulon activity
+# ------------------------------------------------------------
+regulon_cols <- rownames(auc_mat)
+
+patient_auc <- auc_df %>%
+  group_by(Patient, Group) %>%
+  summarise(
+    across(
+      all_of(regulon_cols),
+      ~ mean(.x, na.rm = TRUE)
+    ),
+    nCells = n(),
+    .groups = "drop"
+  )
+
+write.xlsx(
+  patient_auc,
+  "03_Patient_Regulon_Activity.xlsx"
+)
+
+# ------------------------------------------------------------
+# 13. Group-level SOX4 activity
+# ------------------------------------------------------------
+if (length(sox4_cols) > 0) {
+
+  sox4_patient <- patient_auc %>%
+    select(
+      Patient, Group, nCells,
+      all_of(sox4_cols)
+    )
+
+  write.xlsx(
+    sox4_patient,
+    "04_SOX4_Patient_Activity.xlsx"
+  )
+
+  for (gene_regulon in sox4_cols) {
+
+    plot_df <- sox4_patient %>%
+      mutate(
+        Activity = .data[[gene_regulon]],
+        Group = factor(Group, levels = groups)
+      )
+
+    p <- ggplot(
+      plot_df,
+      aes(x = Group, y = Activity, fill = Group)
+    ) +
+      geom_boxplot(
+        width = 0.55,
+        alpha = 0.5,
+        outlier.shape = NA
+      ) +
+      geom_jitter(
+        width = 0.12,
+        size = 2
+      ) +
+      theme_classic(base_size = 13) +
+      theme(legend.position = "none") +
+      labs(
+        title = paste("SOX4 regulon:", gene_regulon),
+        x = NULL,
+        y = "Mean AUCell activity per patient"
+      )
+
+    safe_name <- gsub(
+      "[^A-Za-z0-9_-]",
+      "_",
+      gene_regulon
+    )
+
+    ggsave(
+      paste0("SOX4_Activity_", safe_name, ".png"),
+      p,
+      width = 7,
+      height = 5,
+      dpi = 300
+    )
+  }
+}
+
+# ------------------------------------------------------------
+# 14. SOX4 vs other TF regulon correlations
+# ------------------------------------------------------------
+cor_results <- list()
+
+if (length(sox4_cols) > 0) {
+
+  for (sox4_reg in sox4_cols) {
+
+    for (grp in c("All", groups)) {
+
+      tmp <- if (grp == "All") {
+        patient_auc
+      } else {
+        patient_auc %>% filter(Group == grp)
+      }
+
+      if (nrow(tmp) < 4) next
+
+      results <- lapply(
+        setdiff(regulon_cols, sox4_reg),
+        function(tf) {
+
+          x <- tmp[[sox4_reg]]
+          y <- tmp[[tf]]
+
+          ok <- is.finite(x) & is.finite(y)
+
+          if (
+            sum(ok) < 4 ||
+            sd(x[ok]) == 0 ||
+            sd(y[ok]) == 0
+          ) return(NULL)
+
+          test <- suppressWarnings(
+            cor.test(
+              x[ok],
+              y[ok],
+              method = "spearman",
+              exact = FALSE
+            )
+          )
+
+          data.frame(
+            SOX4_Regulon = sox4_reg,
+            Group = grp,
+            TF_Regulon = tf,
+            Rho = unname(test$estimate),
+            PValue = test$p.value,
+            N_Patients = sum(ok)
+          )
+        }
+      )
+
+      results <- Filter(Negate(is.null), results)
+
+      if (length(results) > 0) {
+        cor_results[[paste(sox4_reg, grp)]] <-
+          bind_rows(results)
+      }
+    }
+  }
+}
+
+if (length(cor_results) > 0) {
+
+  cor_table <- bind_rows(cor_results) %>%
+    group_by(SOX4_Regulon, Group) %>%
+    mutate(
+      FDR = p.adjust(PValue, method = "BH")
+    ) %>%
+    ungroup() %>%
+    arrange(Group, desc(abs(Rho)))
+
+  write.xlsx(
+    cor_table,
+    "05_SOX4_TF_Correlations.xlsx"
+  )
+}
+
+# ------------------------------------------------------------
+# 15. Export regulon target genes
+# ------------------------------------------------------------
+regulons <- loadInt(
+  scenicOptions,
+  "regulons"
+)
+
+target_table <- bind_rows(
+  lapply(names(regulons), function(nm) {
+    data.frame(
+      Regulon = nm,
+      TargetGene = as.character(regulons[[nm]])
+    )
+  })
+)
+
+write.xlsx(
+  target_table,
+  "06_Regulon_Target_Genes.xlsx"
+)
+
+saveRDS(
+  regulons,
+  "SCENIC_Regulons.rds"
+)
+
+# ------------------------------------------------------------
+# 16. Return and upload to bucket
+# ------------------------------------------------------------
+setwd(project_root)
+
+archive <- paste0(basename(outdir), ".tar.gz")
+
+status <- system2(
+  "tar",
+  c("-czf", archive, basename(outdir))
+)
+
+if (status != 0) {
+  stop("Archive creation failed.")
+}
+
+# Google Cloud Storage upload
+status <- system2(
+  "gcloud",
+  c(
+    "storage", "cp",
+    archive,
+    paste0(bucket, "/SCENIC/")
+  )
+)
+
+if (status != 0) {
+  stop("Google Cloud Storage upload failed.")
+}
+
+cat(
+  "\nAnalysis completed.\n",
+  "Local directory: ", outdir, "\n",
+  "Bucket: ", bucket, "/SCENIC/", archive, "\n",
+  sep = ""
+)
